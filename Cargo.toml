@@ -1,0 +1,8 @@
+[package]
+name = "whypa"
+version = "0.0.1"
+edition = "2024"
+description = "Windows-only application"
+
+[dependencies]
+windows = { version = "0.62.2", features = ["Win32_System_Hypervisor", "Win32_System_Memory", "Win32_Foundation"] }
