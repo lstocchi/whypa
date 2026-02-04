@@ -2,133 +2,127 @@
 compile_error!("This project only supports Windows.");
 
 mod partition;
-mod virtio;
+mod memory;
 
 use partition::Partition;
-use std::result::Result;
-use std::env;
+use tracing_subscriber::filter::LevelFilter;
+use anyhow::Context;
 
-fn main() -> Result<(), String> {
-    // Check command line arguments
-    let args: Vec<String> = env::args().collect();
-    let disk_image_path = if args.len() > 1 {
-        Some(args[1].clone())
-    } else {
-        None
-    };
-    
-    // UEFI firmware path - can be provided as second argument or use default
-    let uefi_firmware_path = if args.len() > 2 {
-        Some(args[2].clone())
-    } else {
-        // Default to common OVMF firmware names
-        if std::path::Path::new("OVMF.fd").exists() {
-            Some("OVMF.fd".to_string())
-        } else if std::path::Path::new("OVMF_CODE.fd").exists() {
-            Some("OVMF_CODE.fd".to_string())
-        } else {
-            None
+/// Install and configure the tracing/logging system.
+fn install_tracing() {
+    use tracing_error::ErrorLayer;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::prelude::*;
+
+    let format = fmt::format().without_time().with_target(false).compact();
+
+    let fmt_layer = fmt::layer()
+        .event_format(format)
+        .with_writer(std::io::stderr);
+    let filter_layer = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .with_env_var("WHYP_LOG")
+        .from_env_lossy();
+
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(fmt_layer)
+        .with(ErrorLayer::default())
+        .init();
+}
+
+fn main() -> anyhow::Result<()> {
+    install_tracing();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("Init tokio runtime")?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
+
+    rt.spawn(async move {
+        while let Some(request) = rx.recv().await {
+            match request.as_str() {
+                "quit" => {
+                    break;
+                }
+                _ => {
+                    println!("Unknown request: {}", request);
+                }
+            }
         }
-    };
+    });
 
-    println!("Creating VM partition...");
+    let mut partition = Partition::new().context("Failed to create partition")?;
 
-    let mut partition = Partition::new()?;
-    
-    // Configure for OS boot - use more memory (2GB default)
     partition.configure(1)?;
     partition.setup()?;
     partition.create_vp(0)?;
-    
-    // Allocate memory for the VM
-    partition.allocate_memory()?;
-    println!("Allocated {} MB of memory", partition.get_memory_size() / (1024 * 1024));
 
-    if let Some(image_path) = disk_image_path {
-        println!("\n=== Booting from disk image ===");
+    // The compiled bytes for the assembly above
+    // Using 32-bit addressing mode which should work in 64-bit mode
+    let guest_code: [u8; 14] = [
+        0xB8, 0x21, 0x00, 0x00, 0x00,              // mov eax, 33
+        0x67, 0x89, 0x04, 0x25, 0x00, 0x20, 0x00, 0x00,  // mov [0x2000], eax  (address-size override prefix 0x67)
+        0xF4                                        // hlt
+    ];
+
+    partition.allocate_memory()?;
         
-        // Load UEFI firmware if provided
-        if let Some(ref firmware_path) = uefi_firmware_path {
-            println!("\n=== Loading UEFI Firmware ===");
-            partition.load_uefi_firmware(firmware_path)?;
-        } else {
-            println!("\nWarning: No UEFI firmware provided.");
-            println!("To boot Fedora, you need UEFI firmware (e.g., OVMF.fd).");
-            println!("Usage: {} <disk_image> [uefi_firmware]", args[0]);
-            println!("Or place OVMF.fd or OVMF_CODE.fd in the current directory.");
-        }
-        
-        // Load the disk image
-        partition.load_disk_image(&image_path)?;
-        
-        // Map the disk image to guest physical address space
-        partition.map_disk_image()?;
-        
-        // Map VirtIO MMIO region
-        partition.map_virtio_mmio()?;
-        
-        // UEFI firmware entry point is typically at 0x100000 (1MB) for 64-bit systems
-        // This is where OVMF expects to start execution
-        let boot_address = 0x100000;
-        
-        println!("\n=== Setting up virtual processor for UEFI boot ===");
-        println!("Boot address: 0x{:X}", boot_address);
-        partition.setup_registers_for_boot(0, boot_address)?;
-        
-        println!("\n=== Starting VM execution ===");
-        if uefi_firmware_path.is_some() {
-            println!("UEFI firmware loaded - attempting to boot Fedora...");
-        } else {
-            println!("Warning: No UEFI firmware loaded. Boot may fail.");
-        }
-        println!("Note: For a full OS boot, you still need:");
-        println!("  - Disk controller emulation (AHCI/IDE)");
-        println!("\nRunning VM with exit handling loop...");
-        
-        // Main VM execution loop
-        let mut exit_count = 0u64;
+    // Write code first, then set up registers to point to it
+    partition.write_code(&guest_code, 0x0000)?;
+    println!("Setting up registers...");
+    partition.setup_registers(0, 0x0000)?;  // Set RIP to where the code actually is
+    println!("Registers set up, starting VM...");
+
+    std::thread::spawn(move || {
+        let mut iteration = 0;
         loop {
-            exit_count += 1;
+            iteration += 1;
+            println!("Running VP (iteration {})...", iteration);
+
+             // Run the VP and get exit context
+            let exit_context = {
+                match partition.run_vp(0) {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        println!("Error running VP: {}", e);
+                        break;
+                    }
+                }
+            };
+        
+            println!("VP exited, handling exit...");
             
-            // Run the VM - it will exit on various reasons (I/O, memory access, etc.)
-            let exit_context = partition.run_vp(0)?;
-            
-            // Handle the exit and determine if we should continue
-            let should_continue = partition.handle_exit(0, &exit_context)?;
+            // Handle the exit - wrap in a match to catch any panics
+            let should_continue = {
+                match partition.handle_exit(0, &exit_context) {
+                    Ok(cont) => cont,
+                    Err(e) => {
+                        println!("Error handling exit: {}", e);
+                        false
+                    }
+                }
+            };
             
             if !should_continue {
-                println!("\nVM execution stopped (exit #{})", exit_count);
+                println!("VM execution stopped after {} iterations", iteration);
                 break;
             }
-            
-            // Continue execution - the loop will run the VM again
-            if exit_count % 1000 == 0 {
-                println!("VM still running... ({} exits handled)", exit_count);
-            }
         }
+    });
+
+    rt.block_on(async move {
+        println!("Tokio runtime started on Windows IOCP...");
         
-        println!("\nTotal exits handled: {}", exit_count);
-    } else {
-        println!("\n=== Running simple test code ===");
-        println!("Usage: {} <path_to_disk_image.raw>", args[0]);
-        println!("Running simple infinite loop test instead...\n");
-        
-        // Write a simple infinite loop: jmp $ (0xEB 0xFE)
-        let code = vec![0xEB, 0xFE];
-        partition.write_code(&code, 0)?;
+        // Spawn your Virtio-Net, Virtio-Block, etc.
+        // tokio::spawn(virtio_block_handler());
+        //Ok(())
+        tokio::signal::ctrl_c().await.unwrap();
+    });
 
-        println!("Setting up virtual processor registers...");
-        partition.setup_registers(0, 0)?;
-
-        println!("Running virtual processor...");
-        let exit_context = partition.run_vp(0)?;
-
-        println!("VM exited");
-        println!("Exit reason: {}", exit_context.ExitReason.0);
-    }
-
-    partition.delete()?;
     println!("VM partition deleted");
-    
+
     Ok(())
 }
