@@ -2,42 +2,33 @@
 // This module provides memory protection, MMIO tracking, and debugging features
 
 use windows::Win32::System::Hypervisor::*;
-
-/// Memory protection flags for GPA ranges
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MemoryProtection {
-    /// Read, write, and execute (default)
-    ReadWriteExecute,
-    /// Read and write only (no execute)
-    ReadWrite,
-    /// Read and execute only (no write)
-    ReadExecute,
-    /// Read only (no write, no execute)
-    ReadOnly,
-    /// Execute only (no read, no write)
-    ExecuteOnly,
+use bitflags::bitflags;
+    
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct MemoryPerms: u32 {
+        const READ    = 0b001;
+        const WRITE   = 0b010;
+        const EXECUTE = 0b100;
+        const RW      = Self::READ.bits() | Self::WRITE.bits();
+        const RX      = Self::READ.bits() | Self::EXECUTE.bits();
+        const RWX     = Self::READ.bits() | Self::WRITE.bits() | Self::EXECUTE.bits();
+    }
 }
 
-impl MemoryProtection {
-    /// Convert to WHvMapGpaRangeFlags
+impl MemoryPerms {
     pub fn to_flags(&self) -> WHV_MAP_GPA_RANGE_FLAGS {
-        match self {
-            MemoryProtection::ReadWriteExecute => {
-                WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute
-            }
-            MemoryProtection::ReadWrite => {
-                WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite
-            }
-            MemoryProtection::ReadExecute => {
-                WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagExecute
-            }
-            MemoryProtection::ReadOnly => {
-                WHvMapGpaRangeFlagRead
-            }
-            MemoryProtection::ExecuteOnly => {
-                WHvMapGpaRangeFlagExecute
-            }
-        }
+        let mut flags = WHV_MAP_GPA_RANGE_FLAGS::default();
+        if self.contains(Self::READ)    { flags |= WHvMapGpaRangeFlagRead; }
+        if self.contains(Self::WRITE)   { flags |= WHvMapGpaRangeFlagWrite; }
+        if self.contains(Self::EXECUTE) { flags |= WHvMapGpaRangeFlagExecute; }
+        flags
+    }
+}
+
+impl std::fmt::Display for MemoryPerms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
     }
 }
 
@@ -55,7 +46,8 @@ pub struct MmioRegion {
 pub struct MemoryRegion {
     pub gpa: u64,
     pub size: u64,
-    pub protection: MemoryProtection,
+    pub perms: MemoryPerms,
+    pub hpa: Option<*mut std::ffi::c_void>,
     pub description: String,
 }
 
@@ -63,13 +55,12 @@ pub struct MemoryRegion {
 #[derive(Debug)]
 pub struct MemoryAccessViolation {
     pub gpa: u64,
-    pub is_write: bool,
-    pub is_execute: bool,
+    pub action: MemoryPerms,
     pub access_size: u32,
     pub instruction_rip: u64,
 }
 
-impl MemoryAccessViolation {
+/* impl MemoryAccessViolation {
     pub fn from_exit_context(exit_context: &WHV_RUN_VP_EXIT_CONTEXT) -> Option<Self> {
         unsafe {
             if exit_context.ExitReason.0 == WHvRunVpExitReasonMemoryAccess.0 {
@@ -88,16 +79,16 @@ impl MemoryAccessViolation {
             }
         }
     }
-}
+} */
 
 /// Memory translation debugger
-pub struct MemoryDebugger {
+pub struct Memory {
     pub regions: Vec<MemoryRegion>,
     pub mmio_regions: Vec<MmioRegion>,
     access_log: Vec<(u64, bool, u64)>, // (GPA, is_write, timestamp-ish)
 }
 
-impl MemoryDebugger {
+impl Memory {
     pub fn new() -> Self {
         Self {
             regions: Vec::new(),
@@ -144,7 +135,7 @@ impl MemoryDebugger {
                 region.gpa,
                 region.gpa + region.size,
                 region.description,
-                region.protection
+                region.perms
             );
         }
         
@@ -179,7 +170,7 @@ impl MemoryDebugger {
         let mut analysis = format!(
             "Memory Access Violation:\n  GPA: 0x{:016X}\n  Type: {}\n  Size: {} bytes\n  RIP: 0x{:016X}\n",
             violation.gpa,
-            if violation.is_write { "WRITE" } else if violation.is_execute { "EXECUTE" } else { "READ" },
+            violation.action.to_string(),
             violation.access_size,
             violation.instruction_rip
         );
@@ -190,20 +181,22 @@ impl MemoryDebugger {
                 region.description,
                 region.gpa,
                 region.gpa + region.size,
-                region.protection
+                region.perms
             ));
 
-            // Check if access violates protection
-            let violates = match region.protection {
-                MemoryProtection::ReadOnly => violation.is_write || violation.is_execute,
-                MemoryProtection::ReadExecute => violation.is_write,
-                MemoryProtection::ReadWrite => violation.is_execute,
-                MemoryProtection::ExecuteOnly => !violation.is_execute,
-                MemoryProtection::ReadWriteExecute => false,
-            };
-
-            if violates {
-                analysis.push_str("  ❌ Access violates region protection!\n");
+            match violation.action {
+                MemoryPerms::READ => {
+                    analysis.push_str("  ❌ Read access violation!\n");
+                }
+                MemoryPerms::WRITE => {
+                    analysis.push_str("  ❌ Write access violation!\n");
+                }
+                MemoryPerms::EXECUTE => {
+                    analysis.push_str("  ❌ Execute access violation!\n");
+                }
+                _ => {
+                    
+                }
             }
         } else if let Some(mmio) = self.find_mmio(violation.gpa) {
             analysis.push_str(&format!(
@@ -220,7 +213,7 @@ impl MemoryDebugger {
     }
 }
 
-impl Default for MemoryDebugger {
+impl Default for Memory {
     fn default() -> Self {
         Self::new()
     }

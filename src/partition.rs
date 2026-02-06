@@ -8,15 +8,13 @@ use windows::Win32::Foundation::{HANDLE, CloseHandle};
 use anyhow::Result;
 use std::ptr;
 
-use crate::memory::{MemoryProtection, MemoryDebugger, MemoryRegion};
+use crate::memory::{MemoryPerms, Memory, MemoryRegion, MemoryAccessViolation};
 
 pub struct Partition {
     handle: WHV_PARTITION_HANDLE,
-    memory: Option<*mut std::ffi::c_void>,
-    memory_size: usize,
     is_shared_memory: bool, // Whether memory is from shared mapping
     injected_shared_regions: Vec<InjectedSharedRegion>, // Track injected shared memory regions
-    memory_debugger: MemoryDebugger, // Memory debugging and tracking
+    memory: Memory, // Memory debugging and tracking
 }
 
 #[derive(Clone)]
@@ -43,11 +41,9 @@ impl Partition {
 
             Ok(Self {
                 handle,
-                memory: None,
-                memory_size: DEFAULT_VM_MEMORY_SIZE,
                 is_shared_memory: false,
                 injected_shared_regions: Vec::new(),
-                memory_debugger: MemoryDebugger::new(),
+                memory: Memory::new(),
             })
         }
     }
@@ -85,48 +81,30 @@ impl Partition {
     }
 
     pub fn allocate_memory(&mut self) -> Result<()> {
-        self.allocate_memory_with_size(self.memory_size)
+        self.allocate_memory_with_size(4 * 1024 * 1024, MemoryPerms::RWX)
     }
 
-    pub fn allocate_memory_with_size(&mut self, size: usize) -> Result<()> {
+    pub fn allocate_memory_with_size(&mut self, size: usize, flags: MemoryPerms) -> Result<()> {
         unsafe {
-            // If we already have shared memory, use it instead of allocating new
-            if self.is_shared_memory && self.memory.is_some() {
-                // Map the existing shared memory to GPA range
-                let memory = self.memory.unwrap();
-                WHvMapGpaRange(
-                    self.handle,
-                    memory,
-                    0,
-                    size as u64,
-                    WHvMapGpaRangeFlagExecute | WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite
-                )?;
-                self.memory_size = size;
-                return Ok(());
-            }
+            let source = VirtualAlloc(Some(ptr::null()), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
-            let memory = VirtualAlloc(Some(ptr::null()), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-
-            if memory.is_null() {
+            if source.is_null() {
                 return Err(anyhow::anyhow!("Failed to allocate memory"));
             }
 
             WHvMapGpaRange(
                 self.handle,
-                memory,
+                source,
                 0,
                 size as u64,
-                WHvMapGpaRangeFlagExecute | WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite
+                flags.to_flags()
             )?;
 
-            self.memory = Some(memory);
-            self.memory_size = size;
-
-            // Register the main memory region with the debugger
-            self.memory_debugger.register_region(MemoryRegion {
+            self.memory.register_region(MemoryRegion {
                 gpa: 0,
                 size: size as u64,
-                protection: MemoryProtection::ReadWriteExecute,
+                perms: MemoryPerms::RWX,
+                hpa: Some(source),
                 description: "Main VM Memory".to_string(),
             });
 
@@ -134,42 +112,46 @@ impl Partition {
         }
     }
 
-    pub fn write_code(&self, code: &[u8], offset: usize) -> Result<()> {
-        unsafe {
-            let memory = self.memory.ok_or(anyhow::anyhow!("Memory not allocated"))?;
-            if offset + code.len() > self.memory_size {
-                return Err(anyhow::anyhow!("Code exceeds allocated memory"));
-            }
-            ptr::copy_nonoverlapping(code.as_ptr(), memory.add(offset) as *mut u8, code.len());
-            Ok(())
+    pub fn write_code(&self, code: &[u8], gpa: u64) -> Result<()> {
+        let region = self.memory.find_region(gpa).ok_or(anyhow::anyhow!("Memory not allocated"))?;
+        if gpa + code.len() as u64 > region.gpa + region.size {
+            return Err(anyhow::anyhow!("Code exceeds allocated memory"));
         }
+        if !region.perms.contains(MemoryPerms::WRITE) {
+            return Err(anyhow::anyhow!("Memory is read-only"));
+        }
+        let hpa = region.hpa.ok_or(anyhow::anyhow!("Region has no host physical address"))?;
+        let offset = (gpa - region.gpa) as usize;
+
+        unsafe {
+            ptr::copy_nonoverlapping(code.as_ptr(), hpa.add(offset) as *mut u8, code.len());
+        }
+        Ok(())
     }
 
-    pub fn read_memory(&self, offset: usize, size: usize) -> Result<Vec<u8>, String> {
+    pub fn read_memory(&self, gpa: u64, size: usize) -> Result<Vec<u8>> {
         unsafe {
-            let memory = self.memory.ok_or("Memory not allocated".to_string())?;
-            if offset + size > self.memory_size {
-                return Err("Read exceeds allocated memory".to_string());
+            let region = self.memory.find_region(gpa).ok_or(anyhow::anyhow!("Memory not allocated"))?;
+            if gpa + size as u64 > region.gpa + region.size {
+                return Err(anyhow::anyhow!("Read exceeds allocated memory"));
             }
+
+            if !region.perms.contains(MemoryPerms::READ) {
+                let violation = MemoryAccessViolation {
+                    gpa,
+                    action: MemoryPerms::READ,
+                    access_size: size as u32,
+                    instruction_rip: 0,
+                };
+                return Err(anyhow::anyhow!("Memory access violation: {}", self.memory.analyze_violation(&violation)));
+            }
+
+            let hpa = region.hpa.ok_or(anyhow::anyhow!("Region has no host physical address"))?;
+            let offset = (gpa - region.gpa) as usize;
             let mut data = vec![0u8; size];
-            ptr::copy_nonoverlapping(memory.add(offset) as *const u8, data.as_mut_ptr(), size);
+            ptr::copy_nonoverlapping(hpa.add(offset) as *const u8, data.as_mut_ptr(), size);
             Ok(data)
         }
-    }
-
-    pub fn read_memory_gpa(&self, gpa: u64, size: usize) -> Result<Vec<u8>, String> {
-        // For shared memory scenarios, we need to handle GPA translation
-        // For now, assume GPA maps directly to host memory offset if it's in range
-        // In a full implementation, you'd query the partition for GPA mappings
-        
-        // Check if GPA is within our mapped memory range
-        // Note: This is a simplified check - in reality, GPA mappings can be non-contiguous
-        if gpa as usize + size > self.memory_size {
-            // Try to read anyway - the memory might be mapped at a different GPA
-            // This handles cases where shared memory is mapped at a non-zero GPA
-            return self.read_memory(gpa as usize, size);
-        }
-        self.read_memory(gpa as usize, size)
     }
 
     pub fn setup_registers(&self, vp_id: u32, rip: u64) -> Result<()> {
@@ -221,7 +203,7 @@ impl Partition {
         }
     }
 
-    fn advance_rip(vp_context: WHV_VP_EXIT_CONTEXT, handle: WHV_PARTITION_HANDLE, vp_id: u32) -> Result<(), String> {
+    fn advance_rip(vp_context: WHV_VP_EXIT_CONTEXT, handle: WHV_PARTITION_HANDLE, vp_id: u32) -> Result<()> {
         // Access WHV_VP_EXIT_CONTEXT to get RIP and InstructionLength
         // According to Microsoft docs: https://learn.microsoft.com/en-us/virtualization/api/hypervisor-platform/funcs/whvexitcontextdatatypes
         // InstructionLength is in the lower 4 bits of _bitfield (bits 0-3)
@@ -247,7 +229,7 @@ impl Partition {
                 &[WHvX64RegisterRip] as *const _,
                 1,
                 &mut rip_reg as *mut _ as *mut WHV_REGISTER_VALUE,
-            ).map_err(|e| format!("Failed to advance RIP: {}", e))?;
+            ).map_err(|e| anyhow::anyhow!("Failed to advance RIP: {}", e))?;
         }
         
         
@@ -255,7 +237,7 @@ impl Partition {
         Ok(())
     }
 
-    pub fn handle_exit(&mut self, vp_id: u32, exit_context: &WHV_RUN_VP_EXIT_CONTEXT) -> Result<bool, String> {
+    pub fn handle_exit(&mut self, vp_id: u32, exit_context: &WHV_RUN_VP_EXIT_CONTEXT) -> Result<bool> {
         // Returns true if we should continue running, false if we should stop
         // Safely read exit reason - this should always be valid
         // Use a pointer to avoid potential issues with union access
@@ -312,7 +294,7 @@ impl Partition {
                 // Read register values to debug
                 
                 
-                let data = self.read_memory_gpa(0x2000, 4)?;
+                let data = self.read_memory(0x2000, 4)?;
                 println!("Memory at 0x2000: {:?}", data);
                 let data_32 = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                 println!("Memory at 0x2000: 0x{:X} ({})", data_32, data_32);

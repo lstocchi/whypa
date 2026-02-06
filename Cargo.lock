@@ -357,6 +357,7 @@ name = "whypa"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bitflags",
  "tokio",
  "tracing-error",
  "tracing-subscriber",
