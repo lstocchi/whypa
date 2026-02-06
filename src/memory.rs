@@ -60,18 +60,30 @@ pub struct MemoryAccessViolation {
     pub instruction_rip: u64,
 }
 
-/* impl MemoryAccessViolation {
+impl MemoryAccessViolation {
     pub fn from_exit_context(exit_context: &WHV_RUN_VP_EXIT_CONTEXT) -> Option<Self> {
         unsafe {
             if exit_context.ExitReason.0 == WHvRunVpExitReasonMemoryAccess.0 {
                 let mem_access = &exit_context.Anonymous.MemoryAccess;
                 let access_info = mem_access.AccessInfo.AsUINT32;
                 
+                // Determine access type from AccessInfo bits
+                // Bit 0: Write (1) or Read (0)
+                // Bit 1: Execute (1) or Data (0)
+                let is_write = (access_info & 0x1) != 0;
+                let is_execute = (access_info & 0x2) != 0;
+                
+                let action = match (is_write, is_execute) {
+                    (false, false) => MemoryPerms::READ,
+                    (true, false) => MemoryPerms::WRITE,
+                    (false, true) => MemoryPerms::EXECUTE,
+                    (true, true) => MemoryPerms::WRITE | MemoryPerms::EXECUTE,
+                };
+                
                 Some(Self {
                     gpa: mem_access.Gpa,
-                    is_write: (access_info & 0x1) != 0,
-                    is_execute: (access_info & 0x2) != 0,
-                    access_size: (access_info >> 2) & 0x7, // Bits 2-4
+                    action,
+                    access_size: ((access_info >> 2) & 0x7) as u32, // Bits 2-4
                     instruction_rip: exit_context.VpContext.Rip,
                 })
             } else {
@@ -79,7 +91,7 @@ pub struct MemoryAccessViolation {
             }
         }
     }
-} */
+}
 
 /// Memory translation debugger
 pub struct Memory {
