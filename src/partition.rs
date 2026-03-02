@@ -5,10 +5,13 @@ use windows::Win32::System::{
     },
 };
 use windows::Win32::Foundation::{HANDLE, CloseHandle};
-use anyhow::Result;
-use std::ptr;
 
-use crate::memory::{MemoryPerms, Memory, MemoryRegion, MemoryAccessViolation, MmioRegion};
+use anyhow::Result;
+use anyhow::Context;
+use std::{ffi::c_void, ptr};
+use std::fs;
+
+use crate::{cpu::CpuManager, device_manager::DeviceManager, emulator::{self, Emulator}, linux_boot::{self, LinuxBootPartition}, memory::{layout::{DEVICE_HOLE_START, MEM_32BIT_RESERVED_SIZE, MEM_32BIT_RESERVED_START, RAM_64BIT_START}, memory::{GuestAddress, MemoryAccessViolation, MemoryManager, MemoryPerms, MemoryRegion, MmioRegion}}};
 use std::collections::HashMap;
 
 /// Trait for MMIO device handlers
@@ -22,11 +25,15 @@ pub trait MmioHandler: Send + Sync {
 }
 
 pub struct Partition {
-    handle: WHV_PARTITION_HANDLE,
+    pub handle: WHV_PARTITION_HANDLE,
+    emulator: Emulator, // Emulator handle for instruction emulation
     is_shared_memory: bool, // Whether memory is from shared mapping
     injected_shared_regions: Vec<InjectedSharedRegion>, // Track injected shared memory regions
-    memory: Memory, // Memory debugging and tracking
+    memory: MemoryManager, // Memory debugging and tracking
+    device_manager: DeviceManager, // Device management (PCI, serial, ACPI platform addresses)
+    cpu_manager: CpuManager, // CPU management (ACPI MADT, CPU topology)
     mmio_handlers: HashMap<String, Box<dyn MmioHandler>>, // MMIO device handlers by name
+    pub pci_address_config: u32,
 }
 
 #[derive(Clone)]
@@ -47,40 +54,113 @@ const DEFAULT_VM_MEMORY_SIZE: usize = 2 * 1024 * 1024 * 1024; // 2 GB default fo
 
 impl Partition {
     /// Create a new partition (existing behavior)
-    pub fn new() -> Result<Self> {
+    pub fn new(memory_size: usize) -> Result<Self> {
         unsafe {
             let handle = WHvCreatePartition()?;
 
+            let emulator = emulator::Emulator::new()?;
+                        
+            let mut device_manager = DeviceManager::new(GuestAddress(memory_size as u64));
+            device_manager.init();
             Ok(Self {
                 handle,
+                emulator,
                 is_shared_memory: false,
                 injected_shared_regions: Vec::new(),
-                memory: Memory::new(),
+                memory: MemoryManager::new(),
+                device_manager: device_manager,
+                cpu_manager: CpuManager::new(),
                 mmio_handlers: HashMap::new(),
+                pci_address_config: 0,
             })
         }
     }
 
-    pub fn configure(&self, processor_count: u32) -> Result<()> {
+    pub fn configure(&mut self, processor_count: u32) -> Result<()> {
         unsafe {
 
-            let processor_count = WHV_PARTITION_PROPERTY {
+            let processor_count_prop = WHV_PARTITION_PROPERTY {
                 ProcessorCount: processor_count,
             };
             WHvSetPartitionProperty(
                 self.handle,
                 WHvPartitionPropertyCodeProcessorCount, 
-                &processor_count as *const _ as *const std::ffi::c_void,
+                &processor_count_prop as *const _ as *const std::ffi::c_void,
                 std::mem::size_of::<WHV_PARTITION_PROPERTY>() as u32,
             )?;
+
+            // Update CPU manager with processor count
+            self.cpu_manager.set_cpu_count(processor_count);
 
             Ok(())
         }
     }
 
+    /// Get a reference to the device manager
+    pub fn device_manager(&self) -> &DeviceManager {
+        &self.device_manager
+    }
+
+    /// Get a mutable reference to the device manager
+    pub fn device_manager_mut(&mut self) -> &mut DeviceManager {
+        &mut self.device_manager
+    }
+
+    /// Get a reference to the CPU manager
+    pub fn cpu_manager(&self) -> &CpuManager {
+        &self.cpu_manager
+    }
+
+    /// Get a mutable reference to the CPU manager
+    pub fn cpu_manager_mut(&mut self) -> &mut CpuManager {
+        &mut self.cpu_manager
+    }
+
+    /// Get a reference to the memory manager
+    pub fn memory_manager(&self) -> &MemoryManager {
+        &self.memory
+    }
+
+    /// Get a mutable reference to the memory manager
+    pub fn memory_manager_mut(&mut self) -> &mut MemoryManager {
+        &mut self.memory
+    }
+
+    /// Get a reference to MMIO handlers (for emulator callbacks)
+    pub(crate) fn mmio_handlers(&self) -> &HashMap<String, Box<dyn MmioHandler>> {
+        &self.mmio_handlers
+    }
+
+    /// Get a mutable reference to MMIO handlers (for emulator callbacks)
+    pub(crate) fn mmio_handlers_mut(&mut self) -> &mut HashMap<String, Box<dyn MmioHandler>> {
+        &mut self.mmio_handlers
+    }
+
     pub fn setup(&self) -> Result<()> {
         unsafe {
-            WHvSetupPartition(self.handle)?;
+            // 1. Create the property union
+            let mut property: WHV_PARTITION_PROPERTY = std::mem::zeroed();
+            
+            // 2. Enable Local APIC Emulation
+            // This tells WHP to handle memory at 0xFEE00000 automatically
+            property.LocalApicEmulationMode = WHV_X64_LOCAL_APIC_EMULATION_MODE(1);
+
+            // 3. Apply the property to the partition
+            let result = WHvSetPartitionProperty(
+                self.handle,
+                WHvPartitionPropertyCodeLocalApicEmulationMode,
+                &property as *const _ as *const _,
+                std::mem::size_of::<WHV_PARTITION_PROPERTY>() as u32,
+            );
+
+            if result.is_err() {
+                return Err(anyhow::anyhow!("Failed to enable Local APIC emulation: {:?}", result));
+            }
+
+            
+
+           
+                WHvSetupPartition(self.handle)?;
             Ok(())
         }
     }
@@ -97,55 +177,158 @@ impl Partition {
         self.allocate_memory_with_size(4 * 1024 * 1024, MemoryPerms::RWX)
     }
 
-    pub fn allocate_memory_with_size(&mut self, size: usize, flags: MemoryPerms) -> Result<()> {
+    pub fn allocate_memory_with_size(&mut self, total_memory: u64, flags: MemoryPerms) -> Result<()> {
         unsafe {
-            let source = VirtualAlloc(Some(ptr::null()), size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            let source = VirtualAlloc(Some(ptr::null()), total_memory as usize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
             if source.is_null() {
                 return Err(anyhow::anyhow!("Failed to allocate memory"));
             }
 
-            WHvMapGpaRange(
-                self.handle,
-                source,
-                0,
-                size as u64,
-                flags.to_flags()
-            )?;
+            if total_memory <= MEM_32BIT_RESERVED_START.0 {
+                WHvMapGpaRange(
+                    self.handle,
+                    source,
+                    0,
+                    total_memory,
+                    flags.to_flags()
+                )?;
 
-            self.memory.register_region(MemoryRegion {
-                gpa: 0,
-                size: size as u64,
-                perms: MemoryPerms::RWX,
-                hpa: Some(source),
-                description: "Main VM Memory".to_string(),
-            });
+                self.memory.register_region(MemoryRegion::new(GuestAddress(0), total_memory, MemoryPerms::RWX, Some(source)));
+            } else {
+                // Map the first 3GB
+                let low_size = DEVICE_HOLE_START.0;
+
+                WHvMapGpaRange(
+                    self.handle,
+                    source,
+                    0,
+                    low_size,
+                    flags.to_flags()
+                )?;
+
+                self.memory.register_region(MemoryRegion::new(GuestAddress(0), low_size, MemoryPerms::RWX, Some(source)));
+
+                let gpa = RAM_64BIT_START.0;
+                let size = total_memory - low_size;
+                let high_source = (source as *const u8).add(low_size as usize) as *mut c_void;
+                WHvMapGpaRange(
+                    self.handle,
+                    high_source,
+                    gpa,
+                    size,
+                    flags.to_flags()
+                )?;
+
+                self.memory.register_region(MemoryRegion::new(GuestAddress(gpa), size, MemoryPerms::RWX, Some(high_source))); 
+            }
+
+            // Note: We don't register the 32-bit reserved area as an MMIO region.
+            // It's just unmapped memory - individual MMIO devices within this area
+            // (like virtio, PCI, etc.) should be registered separately.
+            // The reserved area will still be included in the E820 table as reserved memory.
 
             Ok(())
         }
     }
 
-    pub fn write_code(&self, code: &[u8], gpa: u64) -> Result<()> {
-        let region = self.memory.find_region(gpa).ok_or(anyhow::anyhow!("Memory not allocated"))?;
-        if gpa + code.len() as u64 > region.gpa + region.size {
-            return Err(anyhow::anyhow!("Code exceeds allocated memory"));
-        }
-        if !region.perms.contains(MemoryPerms::WRITE) {
-            return Err(anyhow::anyhow!("Memory is read-only"));
-        }
-        let hpa = region.hpa.ok_or(anyhow::anyhow!("Region has no host physical address"))?;
-        let offset = (gpa - region.gpa) as usize;
+    pub fn write_code(&self, code: &[u8], gpa: GuestAddress) -> Result<()> {
+        self.memory.write_guest_memory(code, gpa)
+    }
 
-        unsafe {
-            ptr::copy_nonoverlapping(code.as_ptr(), hpa.add(offset) as *mut u8, code.len());
-        }
+    /// Load a file into guest memory at the specified GPA
+    pub fn load_file(&self, file_path: &str, gpa: GuestAddress) -> Result<usize> {
+        let data = fs::read(file_path)
+            .with_context(|| format!("Failed to read file: {}", file_path))?;
+        self.write_code(&data, gpa)?;
+        Ok(data.len())
+    }
+
+    /// Load Linux kernel and set up boot parameters using linux_loader
+    /// Kernel is loaded at 0x100000 (1MB), boot params at 0x10000 (64KB)
+    pub fn load_linux_kernel(&mut self, kernel_path: &str, initram_path: &str, memory_size: u64) -> Result<u64> {
+        linux_boot::load_linux_kernel(self, kernel_path, initram_path)
+    }
+
+    /// Set up Linux boot parameters structure
+    /// This is a minimal implementation - real boot params are more complex
+    fn setup_linux_boot_params(&self, gpa: GuestAddress) -> Result<()> {
+        // Linux boot_params structure (simplified)
+        // We'll set up minimal fields needed for boot
+        let mut boot_params = vec![0u8; 4096]; // 4KB should be enough for basic params
+        
+        // Set signature "HdrS" (0x53726448) at offset 0x1f1
+        // This identifies it as a valid boot_params structure
+        let hdr_signature: u32 = 0x53726448; // "HdrS"
+        boot_params[0x1f1..0x1f5].copy_from_slice(&hdr_signature.to_le_bytes());
+        
+        // Set version (offset 0x1f6) - u16 value
+        let version: u16 = 0x0208; // Version 2.08
+        boot_params[0x1f6..0x1f8].copy_from_slice(&version.to_le_bytes());
+        
+        // Set kernel_alignment (offset 0x1f7) - typically 0x200000 (2MB)
+        let kernel_align: u32 = 0x200000;
+        boot_params[0x1f7..0x1fb].copy_from_slice(&kernel_align.to_le_bytes());
+        
+        // Set cmd_line_ptr (offset 0x228) - pointer to command line
+        // For now, we'll set it to 0 (no command line)
+        // In a full implementation, you'd put the command line somewhere and point to it
+        
+        // Load type (offset 0x210) - 0x01 = loaded by boot loader
+        boot_params[0x210] = 0x01;
+        
+        // Write boot params to memory
+        self.write_code(&boot_params, gpa)?;
+        //eprintln!("  Boot parameters set up at 0x{:X}", gpa.raw_value());
+        
         Ok(())
     }
 
-    pub fn read_memory(&self, gpa: u64, size: usize) -> Result<Vec<u8>> {
+    /// Set up registers for Linux kernel boot
+    /// RSI should point to boot_params (0x10000)
+    /// Verify current RIP value (for debugging)
+    pub fn verify_rip(&self, vp_id: u32) -> Result<u64> {
+        unsafe {
+            let mut rip_reg = WHV_REGISTER_VALUE::default();
+            WHvGetVirtualProcessorRegisters(
+                self.handle,
+                vp_id,
+                &[WHvX64RegisterRip] as *const _,
+                1,
+                &mut rip_reg as *mut _ as *mut WHV_REGISTER_VALUE,
+            )?;
+            Ok(rip_reg.Reg64)
+        }
+    }
+
+    pub fn setup_linux_registers(&self, vp_id: u32, kernel_entry: u64) -> Result<()> {
+        // Calculate kernel_load_addr from kernel_entry (kernel_entry = kernel_load_addr + 0x200)
+        let kernel_load_addr = kernel_entry;
+        
+        // Read init_size from boot_params (offset 0x260 in boot_params at BOOT_PARAMS_BASE)
+        use crate::linux_boot::BOOT_PARAMS_BASE;
+        let boot_params = self.read_memory(BOOT_PARAMS_BASE, 4096)?;
+        let init_size = if boot_params.len() > 0x260 + 4 {
+            u32::from_le_bytes([
+                boot_params[0x260],
+                boot_params[0x261],
+                boot_params[0x262],
+                boot_params[0x263],
+            ])
+        } else {
+            0x100000 // Default to 1MB if not available
+        };
+        
+        linux_boot::setup_identity_paging(self, kernel_load_addr, init_size)?;
+        linux_boot::setup_linux_registers(self, self.handle, vp_id, kernel_entry)?;
+        
+        Ok(())
+    }
+
+    pub fn read_memory(&self, gpa: GuestAddress, size: usize) -> Result<Vec<u8>> {
         unsafe {
             let region = self.memory.find_region(gpa).ok_or(anyhow::anyhow!("Memory not allocated"))?;
-            if gpa + size as u64 > region.gpa + region.size {
+            if gpa.unchecked_add(size as u64) > region.last_addr() {
                 return Err(anyhow::anyhow!("Read exceeds allocated memory"));
             }
 
@@ -160,7 +343,7 @@ impl Partition {
             }
 
             let hpa = region.hpa.ok_or(anyhow::anyhow!("Region has no host physical address"))?;
-            let offset = (gpa - region.gpa) as usize;
+            let offset = (gpa.raw_value() - region.start_addr().raw_value()) as usize;
             let mut data = vec![0u8; size];
             ptr::copy_nonoverlapping(hpa.add(offset) as *const u8, data.as_mut_ptr(), size);
             Ok(data)
@@ -169,16 +352,48 @@ impl Partition {
 
     /// Register an MMIO region with an optional handler
     pub fn register_mmio_region(&mut self, gpa: u64, size: u64, name: String, handler_name: Option<String>) -> Result<()> {
+        // Check for overlaps with existing memory regions
+        let mmio_end = gpa.checked_add(size).ok_or_else(|| anyhow::anyhow!("MMIO region size overflow"))?;
+        
+        for region in &self.memory.regions {
+            
+            
+            // Check if MMIO overlaps with this memory region
+            // Overlap exists if: mmio_start < region_end && mmio_end > region_gpa
+            if gpa < region.last_addr().raw_value() && mmio_end > region.start_addr().raw_value() {
+                return Err(anyhow::anyhow!(
+                    "MMIO region 0x{:X}-0x{:X} ({}) overlaps with memory region 0x{:X}-0x{:X}",
+                    gpa, mmio_end, name,
+                    region.start_addr().raw_value(), region.last_addr().raw_value()
+                ));
+            }
+        }
+        
+        // Check for overlaps with existing MMIO regions
+        for existing_mmio in &self.memory.mmio_regions {
+            let existing_end = existing_mmio.gpa.0 + existing_mmio.size;
+            
+            if gpa < existing_end && mmio_end > existing_mmio.gpa.0 {
+                return Err(anyhow::anyhow!(
+                    "MMIO region 0x{:X}-0x{:X} ({}) overlaps with existing MMIO region 0x{:X}-0x{:X} ({})",
+                    gpa, mmio_end, name,
+                    existing_mmio.gpa.0, existing_end, existing_mmio.name
+                ));
+            }
+        }
+        
+        //eprintln!("  ✓ MMIO region 0x{:X}-0x{:X} ({}) registered (no overlaps)", gpa, mmio_end, name);
+        
         // Register the MMIO region in memory tracking
         self.memory.register_mmio(MmioRegion {
-            gpa,
+            gpa: GuestAddress(gpa),
             size,
             name: name.clone(),
             handler: handler_name.clone(),
         });
         
         // Don't map this region - MMIO regions should not be mapped to physical memory
-        // They will be handled via memory access exits
+        // WHV will trap unmapped memory accesses and generate memory access exits
         
         Ok(())
     }
@@ -222,8 +437,8 @@ impl Partition {
             )?;
 
             // Don't set CS - let hypervisor use default
-            // Setting CS to 0x8 can cause issues if VM isn't in long mode
-
+            // Setting CS incorrectly can cause "Invalid VP register value" errors
+            // The hypervisor will set appropriate defaults for the VM mode
             Ok(())
         }
     }
@@ -243,17 +458,22 @@ impl Partition {
     }
 
     fn advance_rip(vp_context: WHV_VP_EXIT_CONTEXT, handle: WHV_PARTITION_HANDLE, vp_id: u32) -> Result<()> {
+       
+        // Extract InstructionLength from the lower 4 bits of _bitfield
+        // InstructionLength : 4 means it uses bits 0-3
+        let instruction_length = (vp_context._bitfield & 0x0F) as u64;
+        
+        Self::advance_rip_new(vp_context, instruction_length, handle, vp_id)
+    }
+
+    fn advance_rip_new(vp_context: WHV_VP_EXIT_CONTEXT, instruction_length: u64, handle: WHV_PARTITION_HANDLE, vp_id: u32) -> Result<()> {
         // Access WHV_VP_EXIT_CONTEXT to get RIP and InstructionLength
         // According to Microsoft docs: https://learn.microsoft.com/en-us/virtualization/api/hypervisor-platform/funcs/whvexitcontextdatatypes
         // InstructionLength is in the lower 4 bits of _bitfield (bits 0-3)
         // Cr8 is in the upper 4 bits of _bitfield (bits 4-7)
         let current_rip = vp_context.Rip;
         
-        // Extract InstructionLength from the lower 4 bits of _bitfield
-        // InstructionLength : 4 means it uses bits 0-3
-        let instruction_length = (vp_context._bitfield & 0x0F) as u64;
-        
-        println!("Current RIP: 0x{:X}, Instruction length: {} bytes", current_rip, instruction_length);
+        //eprintln!("Current RIP: 0x{:X}, Instruction length: {} bytes", current_rip, instruction_length);
         
         // Advance RIP past the instruction using the actual instruction length from the exit context
         let new_rip = current_rip + instruction_length;
@@ -271,9 +491,60 @@ impl Partition {
             ).map_err(|e| anyhow::anyhow!("Failed to advance RIP: {}", e))?;
         }
         
-        
-        println!("Advanced RIP to 0x{:X} (skipped {} byte instruction)", new_rip, instruction_length);
+        // Verify RIP was actually set by reading it back
+        let mut verify_rip = WHV_REGISTER_VALUE::default();
+        unsafe {
+            WHvGetVirtualProcessorRegisters(
+                handle,
+                vp_id,
+                &[WHvX64RegisterRip] as *const _,
+                1,
+                &mut verify_rip as *mut _ as *mut WHV_REGISTER_VALUE,
+            ).map_err(|e| anyhow::anyhow!("Failed to verify RIP: {}", e))?;
+            
+            if verify_rip.Reg64 != new_rip {
+                //eprintln!("  ⚠️  WARNING: RIP update failed! Expected 0x{:X}, got 0x{:X}", new_rip, verify_rip.Reg64);
+            } else {
+                //eprintln!("Advanced RIP to 0x{:X} (skipped {} byte instruction) ✓", new_rip, instruction_length);
+            }
+        }
         Ok(())
+    }
+
+    pub fn dump_memory(&self, gpa: GuestAddress, size: usize) -> Result<()> {
+        let data = self.read_memory(gpa, size)?;
+        //eprintln!("--- Memory Dump at 0x{:X} ---", gpa.raw_value());
+        for chunk in data.chunks(16).enumerate() {
+            let offset = chunk.0 * 16;
+            let hex: Vec<String> = chunk.1.iter().map(|b| format!("{:02X}", b)).collect();
+            let ascii: String = chunk.1.iter()
+                .map(|&b| if b >= 32 && b <= 126 { b as char } else { '.' })
+                .collect();
+            //eprintln!("0x{:08X}: {:48} | {} |", gpa.raw_value() + offset as u64, hex.join(" "), ascii);
+        }
+        Ok(())
+    }
+
+    /// Handle I/O port access using emulator (if available) or manual handling
+    fn handle_io_port_with_emulator(
+        &mut self,
+        exit_context: &WHV_RUN_VP_EXIT_CONTEXT,
+    ) -> Result<bool> {
+        let io_port_access_ctx = unsafe { &exit_context.Anonymous.IoPortAccess };
+        let vp_context = &exit_context.VpContext;
+        let result = self.emulator.try_io_emulation(self as *const _ as *const std::ffi::c_void, vp_context, io_port_access_ctx)?;
+        
+        
+        unsafe {
+            let status = result.Anonymous._bitfield as u64;
+            if status & 0x1 == 1 {
+                ////eprintln!("Emulator status: EMULATED");
+                return Ok(true);
+            } else {
+                ////eprintln!("Emulator status: NOT EMULATED");
+                return Ok(false);
+            }
+        }
     }
 
     pub fn handle_exit(&mut self, vp_id: u32, exit_context: &WHV_RUN_VP_EXIT_CONTEXT) -> Result<bool> {
@@ -283,14 +554,38 @@ impl Partition {
         // Access ExitReason field directly - it's not part of the union, so it's always safe
         let exit_reason = exit_context.ExitReason.0;
         
-        // Debug: print exit reason
-        println!("VM exit reason: {} (0x{:X})", exit_reason, exit_reason);
+        // Get current RIP to verify it's actually updated
+        let exit_rip = exit_context.VpContext.Rip;
+        
+        // Track exit reasons to see what's happening (using atomics for thread safety)
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static EXIT_COUNT: AtomicU64 = AtomicU64::new(0);
+        static MEMORY_ACCESS_COUNT: AtomicU64 = AtomicU64::new(0);
+        static OTHER_EXIT_COUNT: AtomicU64 = AtomicU64::new(0);
+        
+        let exit_count = EXIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if exit_reason == WHvRunVpExitReasonMemoryAccess.0 {
+            MEMORY_ACCESS_COUNT.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let other_count = OTHER_EXIT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            // Log non-MMIO exits occasionally to see what's happening
+            
+        }
+        
+        // Log summary every 100k exits
+        if exit_count % 100000 == 0 {
+            let mmio_count = MEMORY_ACCESS_COUNT.load(Ordering::Relaxed);
+            let other_count = OTHER_EXIT_COUNT.load(Ordering::Relaxed);
+            //eprintln!("Exit summary: total={}, MMIO={}, other={}", 
+              //  exit_count, mmio_count, other_count);
+        }
+        
         
         // Match on exit reason - only access union fields in the corresponding match arm
         // Each match arm must only access the union member that corresponds to that exit reason
         match exit_reason {
             x if x == WHvRunVpExitReasonNone.0 => {
-                println!("Unexpected exit reason: None");
+                //eprintln!("Unexpected exit reason: None");
                 Ok(false)
             }
             x if x == WHvRunVpExitReasonMemoryAccess.0 => {
@@ -298,172 +593,364 @@ impl Partition {
                 let violation = MemoryAccessViolation::from_exit_context(exit_context)
                     .ok_or_else(|| anyhow::anyhow!("Failed to extract memory access violation"))?;
                 
-                println!("Memory access: GPA=0x{:X}, action={:?}, size={} bytes", 
-                    violation.gpa, violation.action, violation.access_size);
-                
-                // Check if this is an MMIO region
-                if let Some(mmio_region) = self.memory.find_mmio(violation.gpa) {
-                    println!("MMIO access to {} at GPA 0x{:X}", mmio_region.name, violation.gpa);
+                // Check if this is an MMIO region - if so, use the emulator
+                if let Some(mmio_region) = self.memory.find_mmio(violation.gpa.0) {
+                    // Only log virtio and IOAPIC accesses to reduce noise
+                    if mmio_region.name.contains("Virtio") || mmio_region.name.contains("IOAPIC") {
+                        //eprintln!("MMIO {}: {} at 0x{:X}, RIP=0x{:X}", 
+                           // if violation.action.contains(MemoryPerms::WRITE) { "WRITE" } else { "READ" },
+                           // mmio_region.name, violation.gpa.0, violation.instruction_rip);
+                    }
                     
-                    // Calculate offset within the MMIO region
-                    let offset = violation.gpa - mmio_region.gpa;
+                    // Use the WHP emulator to handle MMIO properly
+                    // The emulator will decode the instruction, determine which register is used,
+                    // call our memory_callback to get/set the value, and update the correct register
+                    let memory_access_ctx = unsafe { &exit_context.Anonymous.MemoryAccess };
+                    let vp_context = &exit_context.VpContext;
                     
-                    // Find and call the handler if one is registered
-                    if let Some(handler_name) = &mmio_region.handler {
-                        if let Some(handler) = self.mmio_handlers.get_mut(handler_name) {
-                            match violation.action {
-                                MemoryPerms::READ => {
-                                    // Handle MMIO read
-                                    let value = handler.handle_read(offset, violation.access_size)?;
-                                    
-                                    // Write the value back to the guest register
-                                    // For now, we'll need to inject the value into RAX
-                                    // This is a simplified approach - in a full implementation,
-                                    // you'd need to decode the instruction and update the correct register
-                                    unsafe {
-                                        let mut rax_reg = WHV_REGISTER_VALUE::default();
-                                        WHvGetVirtualProcessorRegisters(
-                                            self.handle,
-                                            vp_id,
-                                            &[WHvX64RegisterRax] as *const _,
-                                            1,
-                                            &mut rax_reg as *mut _ as *mut WHV_REGISTER_VALUE,
-                                        )?;
-                                        
-                                        // Set lower bits based on access size
-                                        match violation.access_size {
-                                            1 => rax_reg.Reg64 = (rax_reg.Reg64 & 0xFFFFFFFFFFFFFF00) | (value & 0xFF),
-                                            2 => rax_reg.Reg64 = (rax_reg.Reg64 & 0xFFFFFFFFFFFF0000) | (value & 0xFFFF),
-                                            4 => rax_reg.Reg64 = (rax_reg.Reg64 & 0xFFFFFFFF00000000) | (value & 0xFFFFFFFF),
-                                            8 => rax_reg.Reg64 = value,
-                                            _ => return Err(anyhow::anyhow!("Unsupported MMIO read size: {}", violation.access_size)),
-                                        }
-                                        
-                                        WHvSetVirtualProcessorRegisters(
-                                            self.handle,
-                                            vp_id,
-                                            &[WHvX64RegisterRax] as *const _,
-                                            1,
-                                            &mut rax_reg as *mut _ as *mut WHV_REGISTER_VALUE,
-                                        )?;
-                                    }
-                                }
-                                MemoryPerms::WRITE => {
-                                    // Get the value from the guest register (simplified - assumes RAX)
-                                    let value = unsafe {
-                                        let mut rax_reg = WHV_REGISTER_VALUE::default();
-                                        WHvGetVirtualProcessorRegisters(
-                                            self.handle,
-                                            vp_id,
-                                            &[WHvX64RegisterRax] as *const _,
-                                            1,
-                                            &mut rax_reg as *mut _ as *mut WHV_REGISTER_VALUE,
-                                        )?;
-                                        
-                                        // Extract value based on access size
-                                        match violation.access_size {
-                                            1 => rax_reg.Reg64 & 0xFF,
-                                            2 => rax_reg.Reg64 & 0xFFFF,
-                                            4 => rax_reg.Reg64 & 0xFFFFFFFF,
-                                            8 => rax_reg.Reg64,
-                                            _ => return Err(anyhow::anyhow!("Unsupported MMIO write size: {}", violation.access_size)),
-                                        }
-                                    };
-                                    
-                                    handler.handle_write(offset, violation.access_size, value)?;
-                                }
-                                _ => {
-                                    return Err(anyhow::anyhow!("Unsupported MMIO access type: {:?}", violation.action));
+                    match self.emulator.try_mmio_emulation(
+                        self as *const _ as *const std::ffi::c_void,
+                        vp_context,
+                        memory_access_ctx,
+                    ) {
+                        Ok(emulator_status) => {
+                            unsafe {
+                                let status = emulator_status.Anonymous._bitfield as u64;
+                                if status & 0x1 == 1 {
+                                    // Emulator successfully handled the MMIO access
+                                    // It has already updated the correct register and advanced RIP
+                                    Ok(true)
+                                } else {
+                                    // Emulator couldn't handle it - fall back to error
+                                    //eprintln!("  ⚠️ MMIO emulation failed for {} at 0x{:X}", mmio_region.name, violation.gpa.0);
+                                    Ok(false)
                                 }
                             }
-                        } else {
-                            println!("Warning: MMIO handler '{}' not found for {}", handler_name, mmio_region.name);
                         }
-                    } else {
-                        println!("Warning: No handler registered for MMIO region {}", mmio_region.name);
+                        Err(e) => {
+                            //eprintln!("  ⚠️ MMIO emulation error for {} at 0x{:X}: {:?}", mmio_region.name, violation.gpa.0, e);
+                            Ok(false)
+                        }
                     }
                 } else {
                     // Not an MMIO region - check if it's a valid memory region
                     if let Some(region) = self.memory.find_region(violation.gpa) {
                         // Check if access violates protection
                         if !region.perms.contains(violation.action) {
-                            println!("Memory protection violation: {}", self.memory.analyze_violation(&violation));
+                            //eprintln!("Memory protection violation: {}", self.memory.analyze_violation(&violation));
                             return Ok(false);
                         }
                                                 
                         // Valid access to mapped memory - this shouldn't normally cause an exit
                         // unless the region was unmapped. For now, treat as error.
-                        println!("Unexpected memory access exit for mapped region");
+                        //eprintln!("Unexpected memory access exit for mapped region");
                         return Ok(false);
                     } else {
                         // Unmapped memory access - page fault
-                        println!("Page fault: {}", self.memory.analyze_violation(&violation));
+                        //eprintln!("Page fault: {}", self.memory.analyze_violation(&violation));
                         return Ok(false);
                     }
                 }
-                
-                // Advance RIP after handling MMIO
-                Self::advance_rip(exit_context.VpContext, self.handle, vp_id)?;
-                Ok(true)
             }
             x if x == WHvRunVpExitReasonX64IoPortAccess.0 => {
+                // Use emulator if available, otherwise fall back to manual handling
+                self.handle_io_port_with_emulator(exit_context)
+            }
+            x if x == WHvRunVpExitReasonException.0 || x == 4 => {
                 unsafe {
-                    // Only access IoPortAccess fields when exit reason is IoPortAccess
-                    let io_access = &exit_context.Anonymous.IoPortAccess;
-                    let port = io_access.PortNumber;
-                    println!("I/O port access: port=0x{:X}", port);
-
-                    Self::advance_rip(exit_context.VpContext, self.handle, vp_id)?;
+                    // Access VpException fields when exit reason is Exception
+                    let vp_exception = &exit_context.Anonymous.VpException;
+                    //eprintln!("Exception occurred:");
+                    //eprintln!("  Exception Type: {} (0x{:X})", vp_exception.ExceptionType, vp_exception.ExceptionType);
+                    //eprintln!("  Error Code: 0x{:X}", vp_exception.ErrorCode);
+                    //eprintln!("  Exception Parameter: 0x{:X}", vp_exception.ExceptionParameter);
+                    //eprintln!("  RIP: 0x{:X}", exit_context.VpContext.Rip);
+                    
+                    // Common exception types:
+                    // 0x0E = Page Fault (PF)
+                    // 0x0D = General Protection Fault (GPF)
+                    // 0x06 = Invalid Opcode
+                    // 0x00 = Divide Error
+                    match vp_exception.ExceptionType {
+                        0x0E => {
+                            //eprintln!("  → Page Fault detected!");
+                            //eprintln!("  → Error Code: 0x{:X}", vp_exception.ErrorCode);
+                            //eprintln!("  → Faulting Address: 0x{:X}", vp_exception.ExceptionParameter);
+                            //eprintln!("  → This likely means memory at 0x{:X} is not mapped", vp_exception.ExceptionParameter);
+                            //eprintln!("  → Check page tables and memory mapping");
+                        }
+                        0x0D => {
+                            //eprintln!("  → General Protection Fault!");
+                            //eprintln!("  → Error Code: 0x{:X}", vp_exception.ErrorCode);
+                            //eprintln!("  → This might indicate segment register issues or invalid memory access");
+                        }
+                        0x06 => {
+                            //eprintln!("  → Invalid Opcode!");
+                            //eprintln!("  → The instruction at RIP might not be valid for the current CPU mode");
+                        }
+                        0x00 => {
+                            //eprintln!("  → Divide Error!");
+                            //eprintln!("  → Division by zero or overflow");
+                        }
+                        _ => {
+                            //eprintln!("  → Unknown exception type - check x86 exception documentation");
+                        }
+                    }
                 }
-                // Return true to continue execution - now it should execute the 'hlt' instruction
-                Ok(true)
+                Ok(false)
             }
             x if x == WHvRunVpExitReasonUnrecoverableException.0 => {
                 unsafe {
                     // Only access VpException fields when exit reason is UnrecoverableException
                     let vp_exception = &exit_context.Anonymous.VpException;
-                    println!("Unrecoverable exception: {}", vp_exception.ExceptionType);
+                    //eprintln!("Unrecoverable exception: {}", vp_exception.ExceptionType);
+                    //eprintln!("  RIP: 0x{:X}", exit_context.VpContext.Rip);
+                    //eprintln!("  ⚠️  This might be how WHV handles unmapped memory access!");
+                    //eprintln!("  ⚠️  Check if this exception type indicates a memory access violation");
                 }
                 Ok(false)
             }
             x if x == WHvRunVpExitReasonInvalidVpRegisterValue.0 => {
-                println!("Invalid VP register value");
+                //eprintln!("Invalid VP register value");
                 Ok(false)
             }
             x if x == WHvRunVpExitReasonUnsupportedFeature.0 => {
-                println!("Unsupported feature");
+                //eprintln!("Unsupported feature");
                 Ok(false)
             }
             x if x == WHvRunVpExitReasonX64InterruptWindow.0 => {
-                println!("Interrupt window");
+                // Interrupt window - kernel is ready to receive interrupts
+                // Inject a timer interrupt (IRQ 0) periodically to allow kernel scheduling
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static LAST_INTERRUPT_TIME: AtomicU64 = AtomicU64::new(0);
+                static INTERRUPT_COUNT: AtomicU64 = AtomicU64::new(0);
+                
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
+                
+                // Inject timer interrupt on every interrupt window to keep kernel progressing
+                // The kernel is stuck waiting for interrupts, so we need to inject them frequently
+                let count = INTERRUPT_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                
+                // Inject interrupt every time (or at least very frequently)
+                // The 10ms throttling might be preventing the kernel from making progress
+                let last_time = LAST_INTERRUPT_TIME.load(Ordering::Relaxed);
+                let should_inject = now.saturating_sub(last_time) >= 1 || last_time == 0; // Every 1ms or first time
+                
+                if should_inject {
+                    LAST_INTERRUPT_TIME.store(now, Ordering::Relaxed);
+                    
+                    // Log first few interrupts to verify they're being injected
+                    if count <= 10 {
+                        //eprintln!("Injecting timer interrupt #{} at RIP 0x{:X}", count, exit_rip);
+                    }
+                    
+                    // Inject Local APIC timer interrupt using WHvRequestInterrupt
+                    // Vector 0x20 is the timer interrupt (IRQ 0 mapped to vector 0x20)
+                    unsafe {
+                        // WHV_INTERRUPT_CONTROL structure:
+                        // _bitfield: contains interrupt type (bits 0-3) and other flags
+                        // Destination: destination CPU (0 = broadcast to all)
+                        // Vector: interrupt vector
+                        let interrupt_control = WHV_INTERRUPT_CONTROL {
+                            _bitfield: WHvX64InterruptTypeFixed.0 as u64, // Set interrupt type in bitfield
+                            Destination: 0, // Broadcast to all CPUs
+                            Vector: 0x20, // Timer interrupt vector
+                        };
+                        
+                        let result = WHvRequestInterrupt(
+                            self.handle,
+                            &interrupt_control as *const _,
+                            std::mem::size_of::<WHV_INTERRUPT_CONTROL>() as u32,
+                        );
+                        
+                        if result.is_err() {
+                            // Log errors for first few attempts
+                            if count <= 10 {
+                                //eprintln!("Failed to inject timer interrupt #{}: {:?}", count, result);
+                            }
+                        } else if count <= 10 {
+                            //eprintln!("Successfully injected timer interrupt #{}", count);
+                        }
+                    }
+                }
                 Ok(true)
             }
             x if x == WHvRunVpExitReasonX64Halt.0 => {
-                // Read register values to debug
-                
-                
-                let data = self.read_memory(0x2000, 4)?;
-                println!("Memory at 0x2000: {:?}", data);
-                let data_32 = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                println!("Memory at 0x2000: 0x{:X} ({})", data_32, data_32);
-                println!("VM halted");
-                Ok(false)
+                // VM executed HLT instruction - kernel is waiting for an interrupt
+                // For now, we'll just continue (in a real implementation, we'd inject a timer interrupt)
+                // Log occasionally to avoid spam
+                static mut HALT_COUNT: u64 = 0;
+                unsafe {
+                    HALT_COUNT += 1;
+                    if HALT_COUNT % 10000 == 0 {
+                        
+                            //eprintln!("VM halted times at RIP 0x{:X} (waiting for interrupt?)", 
+                            //exit_context.VpContext.Rip);    
+                        
+                        
+                    }
+                }
+                Ok(true) // Continue execution - kernel will wake up when interrupt is injected
             }
             x if x == WHvRunVpExitReasonX64ApicEoi.0 => {
-                println!("APIC EOI");
+                //eprintln!("APIC EOI");
+                Ok(true)
+            }
+            x if x == WHvRunVpExitReasonX64Cpuid.0 => {
+                eprintln!("CPUID: 0x{:X}", exit_context.VpContext.Rip);
+
+                let cpuid_access = unsafe { &exit_context.Anonymous.CpuidAccess };
+                let leaf = cpuid_access.Rax;
+
+                let mut rax = cpuid_access.DefaultResultRax;
+                let mut rbx = cpuid_access.DefaultResultRbx;
+                let mut rcx = cpuid_access.DefaultResultRcx;
+                let mut rdx = cpuid_access.DefaultResultRdx;
+
+                match leaf {
+                    _ => {
+                        // For all standard CPUID requests (like getting the vendor string
+                        // or cache sizes), we just pass through the default results.
+                    }
+                }
+
+                let next_rip = exit_context.VpContext.Rip + (exit_context.VpContext._bitfield & 0x0F) as u64;
+
+                let register_names = [
+                    WHvX64RegisterRax,
+                    WHvX64RegisterRbx,
+                    WHvX64RegisterRcx,
+                    WHvX64RegisterRdx,
+                    WHvX64RegisterRip,
+                ];
+                
+                let register_values = [
+                    WHV_REGISTER_VALUE { Reg64: rax },
+                    WHV_REGISTER_VALUE { Reg64: rbx },
+                    WHV_REGISTER_VALUE { Reg64: rcx },
+                    WHV_REGISTER_VALUE { Reg64: rdx },
+                    WHV_REGISTER_VALUE { Reg64: next_rip },
+                ];
+
+                unsafe {
+                    WHvSetVirtualProcessorRegisters(
+                        self.handle,
+                        0,
+                        register_names.as_ptr(),
+                        register_names.len() as u32,
+                        register_values.as_ptr(),
+                    )?;
+                }
+
+
+                Ok(true)
+            }
+            x if x == WHvRunVpExitReasonX64MsrAccess.0 => {
+                let msr_access = unsafe { &exit_context.Anonymous.MsrAccess };
+                let msr_number = msr_access.MsrNumber;
+                let is_write = unsafe { msr_access.AccessInfo.Anonymous._bitfield } & 0x1 != 0; // Bit 0 is Write
+
+                let mut rax = 0u64;
+                let mut rdx = 0u64;
+
+                match msr_number {
+                    0x40000000 => { // HV_X64_MSR_GUEST_OS_ID
+                        // If it's a read, we can just return 0 or whatever was last written.
+                        // Linux writes to this to identify itself.
+                    }
+                    0x40000001 => { // HV_X64_MSR_HYPERCALL
+                        // This is the big one. Linux expects to see 'Enabled' bit (bit 0) 
+                        // if it previously wrote to it.
+                        if !is_write {
+                            rax = 1; // Mark as enabled
+                        }
+                    }
+                    0x40000020 => { // HV_X64_MSR_TIME_REF_COUNT
+                        // Return elapsed time since VM start in 100ns increments (Hyper-V reference time).
+                        // BUG FIX: Previously used Instant::now().elapsed() which always returns ~0.
+                        // Must use a fixed start time so the clock actually advances.
+                        use std::sync::OnceLock;
+                        static VM_START_TIME: OnceLock<std::time::Instant> = OnceLock::new();
+                        let start = VM_START_TIME.get_or_init(|| std::time::Instant::now());
+                        let ticks = start.elapsed().as_nanos() / 100; // 100ns increments
+                        rax = (ticks & 0xFFFFFFFF) as u64;
+                        rdx = ((ticks >> 32) & 0xFFFFFFFF) as u64;
+                    }
+                    _ => {}
+                }
+
+                if !is_write {
+                    // For reads (RDMSR), we must put the result in RAX and RDX
+                    let names = [WHvX64RegisterRax, WHvX64RegisterRdx];
+                    let values = [
+                        WHV_REGISTER_VALUE { Reg64: rax },
+                        WHV_REGISTER_VALUE { Reg64: rdx },
+                    ];
+                    unsafe {
+                        WHvSetVirtualProcessorRegisters(self.handle, 0, &names as *const _, 2, &values as *const _)?;
+                    }
+                }
+
+                // Advance RIP
+                Self::advance_rip_new(exit_context.VpContext, (exit_context.VpContext._bitfield & 0x0F) as u64, self.handle, 0)?;
                 Ok(true)
             }
             _ => {
-                println!("Unknown exit reason: {}", exit_reason);
+                //eprintln!("Unknown exit reason: {} (0x{:X})", exit_reason, exit_reason);
+                //eprintln!("  RIP: 0x{:X}", exit_context.VpContext.Rip);
+                //eprintln!("  ⚠️  This might be how WHV reports unmapped memory access!");
+                //eprintln!("  ⚠️  Check WHV documentation for exit reason {}", exit_reason);
                 Ok(false)
             }
         }
     }
 }
 
+impl LinuxBootPartition for Partition {
+    fn load_file(&self, file_path: &str, gpa: u64) -> Result<usize> {
+        self.load_file(file_path, GuestAddress(gpa))
+    }
+
+    fn write_code(&self, code: &[u8], gpa: u64) -> Result<()> {
+        self.write_code(code, GuestAddress(gpa))
+    }
+
+    fn get_handle(&self) -> WHV_PARTITION_HANDLE {
+        self.handle
+    }
+    
+    fn get_memory_size(&self) -> u64 {
+        // Find the largest memory region to determine total memory size
+        self.memory.regions.iter()
+            .map(|r| r.start_addr().raw_value() + r.len())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn device_manager(&self) -> &DeviceManager {
+        &self.device_manager
+    }
+
+    fn cpu_manager(&self) -> &CpuManager {
+        &self.cpu_manager
+    }
+
+    fn memory_manager(&self) -> &MemoryManager {
+        &self.memory
+    }
+}
+
 impl Drop for Partition {
     fn drop(&mut self) {
         unsafe {
+            // Destroy emulator handle
+            if !self.emulator.handle.is_null() {
+                let _ = WHvEmulatorDestroyEmulator(self.emulator.handle);
+            }
+            
             // Clean up injected shared memory regions
             for region in &self.injected_shared_regions {
                 // Unmap from guest GPA space
