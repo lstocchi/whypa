@@ -6,8 +6,23 @@ description = "Windows-only application"
 
 [dependencies]
 anyhow = "1.0"
+acpi_tables = "0.2.0"
 bitflags = "2.10.0"
+file-id = "0.2.3"
+imago = { version = "0.2.2", features = ["sync-wrappers", "vm-memory"] }
+smallvec = "1.15.1"
+thiserror = "2.0.18"
 tokio = { version = "1", features = ["full"] }
+tracing = { version = "0.1", features = ["attributes"] }
 tracing-error = { version = "0.2.0" }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
-windows = { version = "0.62.2", features = ["Win32_System_Hypervisor", "Win32_System_Memory", "Win32_Foundation", "Win32_Security"] }
+vm-memory = { path = "vm-memory" }
+virtio-bindings = "0.2.7"
+virtio-queue = { version = "0.17.0", default-features = false }
+windows = { version = "0.62.2", features = ["Win32_System_Hypervisor", "Win32_Networking_WinSock", "Win32_System_Memory", "Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Storage", "Win32_Networking", "Win32_Storage_FileSystem", "Win32_Networking_WinSock", "Win32_System_IO"] }
+zerocopy = "0.8.39"
+zerocopy-derive = "0.8.39"
+
+[patch.crates-io]
+vm-memory = { path = "vm-memory" }
