@@ -105,8 +105,8 @@ pub const MEM_32BIT_DEVICES_SIZE: u64 = 640 << 20; // Ends at 0xe800_0000
 
 // 2. PCI MMCONFIG space (256 MiB)
 // This matches your log: "PCI: ECAM [mem 0xe8000000-0xe80fffff]"
-pub const PCI_MMCONFIG_START: GuestAddress = 
-    GuestAddress(MEM_32BIT_DEVICES_START.0 + MEM_32BIT_DEVICES_SIZE);
+pub const PCI_MMCONFIG_START: GuestAddress = GuestAddress(0xe800_0000);
+//    GuestAddress(MEM_32BIT_DEVICES_START.0 + MEM_32BIT_DEVICES_SIZE);
 pub const PCI_MMCONFIG_SIZE: u64 = 256 << 20; // Ends at 0xf800_0000
 
 // One bus with potentially 256 devices (32 slots x 8 functions).
