@@ -110,7 +110,7 @@ fn main() -> anyhow::Result<()> {
     
     // Check if we should boot Linux kernel or use test assembly
     let kernel_path = std::env::var("KERNEL_PATH").unwrap_or_else(|_| "kernels/vmlinuz2".to_string());
-    let initram_path = std::env::var("INITRAM_PATH").unwrap_or_else(|_| "kernels/initramfs".to_string());
+    let initram_path = std::env::var("INITRAM_PATH").unwrap_or_else(|_| "kernels/initramfs.img".to_string());
     
     
     
@@ -325,6 +325,46 @@ fn main() -> anyhow::Result<()> {
         VIRTIO_IRQ,
     );
     //eprintln!("Virtio block device registered at 0x{:X} with IRQ {} (ACPI: VBLK)", VIRTIO_MMIO_BASE, VIRTIO_IRQ);
+
+    // Register virtio-rng device
+    const VIRTIO_RNG_MMIO_BASE: u64 = VIRTIO_MMIO_BASE + VIRTIO_MMIO_SIZE;
+    const VIRTIO_RNG_IRQ: u32 = 21;
+
+    use crate::devices::virtio::rng::Rng;
+    let rng_device = Arc::new(Mutex::new(Rng::new()));
+
+    let rng_irqchip: crate::devices::legacy::irqchip::IrqChip = Arc::new(Mutex::new(
+        IrqChipDevice::new(Box::new(SimpleIrqChip::new(0, 0)))
+    ));
+
+    let mut rng_mmio_transport = MmioTransport::new(
+        partition.memory_manager().clone(),
+        rng_irqchip,
+        rng_device.clone(),
+    )?;
+    rng_mmio_transport.set_irq_line(VIRTIO_RNG_IRQ);
+
+    let rng_mmio_adapter = MmioTransportAdapter::new(rng_mmio_transport);
+
+    partition.register_mmio_region(
+        VIRTIO_RNG_MMIO_BASE,
+        VIRTIO_MMIO_SIZE,
+        "Virtio RNG Device".to_string(),
+        Some("virtio_rng".to_string()),
+    )?;
+
+    partition.register_mmio_handler(
+        "virtio_rng".to_string(),
+        Box::new(rng_mmio_adapter),
+    );
+
+    partition.device_manager_mut().register_virtio_mmio(
+        "VRNG".to_string(),
+        2,
+        VIRTIO_RNG_MMIO_BASE,
+        VIRTIO_MMIO_SIZE,
+        VIRTIO_RNG_IRQ,
+    );
     
     let kernel_entry: u64;
     

@@ -581,6 +581,7 @@ impl Partition {
         }
         
         
+        
         // Match on exit reason - only access union fields in the corresponding match arm
         // Each match arm must only access the union member that corresponds to that exit reason
         match exit_reason {
