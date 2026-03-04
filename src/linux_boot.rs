@@ -212,8 +212,7 @@ fn setup_linux_boot_params<P: LinuxBootPartition>(partition: &P, gpa: GuestAddre
     use crate::memory::layout::VIRTIO_MMIO_START;
     let virtio_base = VIRTIO_MMIO_START.0;
     let cmd_line = format!(
-        "console=ttyS0 earlycon=uart8250,io,0x3f8 no_timer_check clocksource=tsc tsc=reliable noreplace-smp lpj=2000000 root=/dev/vda1 rw virtio_mmio.device=4K@0x{:08x}:20 virtio_mmio.device=4K@0xc0001000:21 rootwait rootdelay=1 raid=noautodetect systemd.mask=systemd-vconsole-setup.service", 
-        virtio_base
+        "console=ttyS0 root=/dev/vda rw init=/bin/sh"
     );//eprintln!("  Kernel command line: {}", cmd_line);
     let cmd_line_bytes = cmd_line.as_bytes();
 
@@ -252,7 +251,7 @@ fn setup_linux_boot_params<P: LinuxBootPartition>(partition: &P, gpa: GuestAddre
         offset += 20;
     }
     
-    // Add individual MMIO regions as reserved
+    // Add individual MMIO regions as reserved so they don't conflict with PCI resource claims
     let mmio_regions = partition.memory_manager().get_mmio_regions();
     for region in mmio_regions {
         write_e820(&mut boot_params, offset, region.gpa.0, region.size, 2);

@@ -84,20 +84,13 @@ pub const HIGH_RAM_START: GuestAddress = GuestAddress(0x100000);
 
 // ** 32-bit reserved area (start: 3GiB, length: 896MiB) **
 //pub const MEM_32BIT_RESERVED_START: GuestAddress = GuestAddress(0xc000_0000); // PCI_MMCONFIG_SIZE + MEM_32BIT_DEVICES_SIZE + VIRTIO_MMIO_SIZE_PER_DEVICE * VIRTIO_MMIO_MAX_DEVICES;
-pub const DEVICE_HOLE_START: GuestAddress = GuestAddress(0xc000_0000);
+//pub const DEVICE_HOLE_START: GuestAddress = ;
 // == Fixed constants within the "32-bit reserved" range ==
 
-// VirtIO MMIO space
-// 3. VirtIO MMIO space (Starts exactly where your boot arg pointed: 0xf800_0000)
-// We place this AFTER the PCI ECAM space but BEFORE the IOAPIC.
-pub const VIRTIO_MMIO_START: GuestAddress = DEVICE_HOLE_START;
-pub const VIRTIO_MMIO_SIZE_PER_DEVICE: u64 = 0x1000; // Increased to 4KiB to match your "4K@0xf8000000" arg
-pub const VIRTIO_MMIO_MAX_DEVICES: u64 = 8;
-pub const VIRTIO_MMIO_TOTAL_SIZE: u64 = VIRTIO_MMIO_SIZE_PER_DEVICE * VIRTIO_MMIO_MAX_DEVICES;
+
 
 // PCI space starts after VirtIO
-pub const MEM_32BIT_DEVICES_START: GuestAddress = 
-    GuestAddress(VIRTIO_MMIO_START.0 + VIRTIO_MMIO_TOTAL_SIZE);
+pub const MEM_32BIT_DEVICES_START: GuestAddress = GuestAddress(0xc000_0000);
 
 // Sub range: 32-bit PCI devices (start: 3GiB, length: 640Mib)
 //pub const MEM_32BIT_DEVICES_START: GuestAddress = DEVICE_HOLE_START;
@@ -126,6 +119,15 @@ pub const MEM_32BIT_RESERVED_START: GuestAddress = GuestAddress(0xfec0_0000);
 pub const MEM_32BIT_RESERVED_SIZE: u64 = 0x1_0000_0000 - MEM_32BIT_RESERVED_START.0;
 
 // == End of "32-bit reserved" range. ==
+
+
+// VirtIO MMIO space
+// 3. VirtIO MMIO space (Starts exactly where your boot arg pointed: 0xf800_0000)
+// We place this AFTER the PCI ECAM space but BEFORE the IOAPIC.
+pub const VIRTIO_MMIO_START: GuestAddress = GuestAddress(0xfeb0_0000);
+pub const VIRTIO_MMIO_SIZE_PER_DEVICE: u64 = 0x1000; // Increased to 4KiB to match your "4K@0xf8000000" arg
+pub const VIRTIO_MMIO_MAX_DEVICES: u64 = 8;
+pub const VIRTIO_MMIO_TOTAL_SIZE: u64 = VIRTIO_MMIO_SIZE_PER_DEVICE * VIRTIO_MMIO_MAX_DEVICES;
 
 // ** 64-bit RAM start (start: 4GiB, length: varies) **
 pub const RAM_64BIT_START: GuestAddress = GuestAddress(0x1_0000_0000);

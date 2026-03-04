@@ -162,7 +162,7 @@ impl DeviceManager {
                     id: 0, 
                     mmio_config_address: layout::PCI_MMCONFIG_START.0, 
                     start_of_mem32_area: layout::MEM_32BIT_DEVICES_START.0, 
-                    end_of_mem32_area: layout::MEM_32BIT_DEVICES_START.0 + layout::MEM_32BIT_DEVICES_SIZE, 
+                    end_of_mem32_area: layout::MEM_32BIT_DEVICES_START.0 + layout::MEM_32BIT_DEVICES_SIZE - 1, 
                     start_of_mem64_area: total_memory_gpa.0 + 1, 
                     end_of_mem64_area: 0x3fff_ffff_ffff,
                 }, // for local VM, 1 segment is enough

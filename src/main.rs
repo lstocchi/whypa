@@ -257,7 +257,7 @@ fn main() -> anyhow::Result<()> {
     const VIRTIO_IRQ: u32 = 20; // IRQ line for virtio device
     
     // Create a disk image if it doesn't exist
-    let disk_image_path = std::env::var("DISK_IMAGE").unwrap_or_else(|_| "disk.img".to_string());
+    let disk_image_path = std::env::var("DISK_IMAGE").unwrap_or_else(|_| "kernels/alpine-virt.img".to_string());
     if !std::fs::metadata(&disk_image_path).is_ok() {
         //eprintln!("Creating disk image: {}", disk_image_path);
         // Create a 1GB disk image
@@ -303,7 +303,7 @@ fn main() -> anyhow::Result<()> {
     let mmio_adapter = MmioTransportAdapter::new(mmio_transport);
     
     // Register MMIO region
-    partition.register_mmio_region(
+     partition.register_mmio_region(
         VIRTIO_MMIO_BASE,
         VIRTIO_MMIO_SIZE,
         "Virtio Block Device".to_string(),
@@ -346,7 +346,7 @@ fn main() -> anyhow::Result<()> {
 
     let rng_mmio_adapter = MmioTransportAdapter::new(rng_mmio_transport);
 
-    partition.register_mmio_region(
+     partition.register_mmio_region(
         VIRTIO_RNG_MMIO_BASE,
         VIRTIO_MMIO_SIZE,
         "Virtio RNG Device".to_string(),

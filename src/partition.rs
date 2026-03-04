@@ -11,7 +11,7 @@ use anyhow::Context;
 use std::{ffi::c_void, ptr};
 use std::fs;
 
-use crate::{cpu::CpuManager, device_manager::DeviceManager, emulator::{self, Emulator}, linux_boot::{self, LinuxBootPartition}, memory::{layout::{DEVICE_HOLE_START, MEM_32BIT_RESERVED_SIZE, MEM_32BIT_RESERVED_START, RAM_64BIT_START}, memory::{GuestAddress, MemoryAccessViolation, MemoryManager, MemoryPerms, MemoryRegion, MmioRegion}}};
+use crate::{cpu::CpuManager, device_manager::DeviceManager, emulator::{self, Emulator}, linux_boot::{self, LinuxBootPartition}, memory::{layout::{MEM_32BIT_DEVICES_START, MEM_32BIT_RESERVED_SIZE, MEM_32BIT_RESERVED_START, RAM_64BIT_START}, memory::{GuestAddress, MemoryAccessViolation, MemoryManager, MemoryPerms, MemoryRegion, MmioRegion}}};
 use std::collections::HashMap;
 
 /// Trait for MMIO device handlers
@@ -197,7 +197,7 @@ impl Partition {
                 self.memory.register_region(MemoryRegion::new(GuestAddress(0), total_memory, MemoryPerms::RWX, Some(source)));
             } else {
                 // Map the first 3GB
-                let low_size = DEVICE_HOLE_START.0;
+                let low_size = MEM_32BIT_DEVICES_START.0;
 
                 WHvMapGpaRange(
                     self.handle,
