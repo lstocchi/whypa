@@ -206,8 +206,12 @@ impl<'a> Reader<'a> {
                     .ok_or(Error::DescriptorChainOverflow)?;
 
                 let region = mem.find_region(desc.addr).ok_or(Error::FindMemoryRegion)?;
+                let offset = desc
+                    .addr
+                    .checked_sub(region.start_addr().raw_value())
+                    .unwrap();
                 region
-                    .get_slice(desc.addr, desc.len as usize)
+                    .get_slice(offset, desc.len as usize)
                     .map_err(Error::GuestMemoryError)
             })
             .collect::<Result<VecDeque<VolatileSlice<'a>>>>()?;
