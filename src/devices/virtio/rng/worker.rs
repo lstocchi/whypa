@@ -98,6 +98,8 @@ impl RngWorker {
 
     fn process_queue(&mut self) {
         let mem = &self.mem;
+        let mut used_any = false;
+
         while let Some(head) = self.device_queue.queue.pop(mem) {
             let mut writer = match Writer::new(mem, head.clone()) {
                 Ok(w) => w,
@@ -112,6 +114,7 @@ impl RngWorker {
                 if let Err(e) = self.device_queue.queue.add_used(mem, head.index, 0) {
                     error!("virtio_rng: failed to add used: {e:?}");
                 }
+                used_any = true;
                 continue;
             }
 
@@ -133,14 +136,19 @@ impl RngWorker {
                 0
             };
 
+            tracing::info!("virtio_rng: request len={}, written={}", len, written);
+
             if let Err(e) = self.device_queue.queue.add_used(mem, head.index, written as u32) {
                 error!("virtio_rng: failed to add used: {e:?}");
             }
 
-            if self.device_queue.queue.needs_notification(mem).unwrap() {
-                if let Err(e) = self.interrupt.try_signal_used_queue() {
-                    error!("virtio_rng: failed to signal queue: {e:?}");
-                }
+            used_any = true;
+        }
+
+        // Signal a single interrupt for the whole batch instead of per-descriptor.
+        if used_any && self.device_queue.queue.needs_notification(mem).unwrap() {
+            if let Err(e) = self.interrupt.try_signal_used_queue() {
+                error!("virtio_rng: failed to signal queue: {e:?}");
             }
         }
     }

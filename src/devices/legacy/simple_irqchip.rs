@@ -64,4 +64,9 @@ impl IrqChipT for SimpleIrqChip {
         }
         Ok(())
     }
+
+    fn clear_irq(&self, _irq_line: Option<u32>) -> Result<(), DeviceError> {
+        // Simple IRQ chip doesn't track line level
+        Ok(())
+    }
 }

@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Write};
 
 use windows::Win32::System::{
     Hypervisor::*,
@@ -94,6 +94,22 @@ impl Emulator {
             } else {
                 // IN instruction - read data
                 match port {
+                    0x3F8 => {
+                        // Read a character from stdin
+                        let mut buf = [0u8; 1];
+                        match std::io::stdin().read(&mut buf) {
+                            Ok(1) => io_info.Data = buf[0] as u32,
+                            _ => io_info.Data = 0,
+                        }
+                    }
+                    0x3FD => {
+                        // LSR - check if input is available
+                        let mut status: u32 = 0x60; // TX always ready
+                        // Set bit 0 (Data Ready) if stdin has data
+                        // Simple approach: always say data is ready
+                        status |= 0x01;
+                        io_info.Data = status;
+                    }
                     0x3F9 => {
                         io_info.Data = SERIAL_IER as u32;
                     }

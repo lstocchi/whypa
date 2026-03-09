@@ -158,6 +158,8 @@ impl BlockWorker {
     }
 
     fn process_queue(&mut self, mem: &MemoryManager) {
+        let mut used_any = false;
+
         while let Some(head) = self.device_queue.queue.pop(mem) {
             let mut reader = match Reader::new(mem, head.clone()) {
                 Ok(r) => r,
@@ -197,15 +199,19 @@ impl BlockWorker {
             if let Err(e) = self
                 .device_queue
                 .queue
-                .add_used(mem, head.index, len as u32)
+                .add_used(mem, head.index, (len + 1) as u32)
             {
                 error!("failed to add used elements to the queue: {e:?}");
             }
 
-            if self.device_queue.queue.needs_notification(mem).unwrap() {
-                if let Err(e) = self.interrupt.try_signal_used_queue() {
-                    error!("error signalling queue: {e:?}");
-                }
+            used_any = true;
+        }
+
+        // Signal a single interrupt for the whole batch of completed requests
+        // instead of one per descriptor, avoiding unnecessary interrupt storms.
+        if used_any && self.device_queue.queue.needs_notification(mem).unwrap() {
+            if let Err(e) = self.interrupt.try_signal_used_queue() {
+                error!("error signalling queue: {e:?}");
             }
         }
     }

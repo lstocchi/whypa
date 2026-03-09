@@ -797,7 +797,15 @@ impl Partition {
                 Ok(true) // Continue execution - kernel will wake up when interrupt is injected
             }
             x if x == WHvRunVpExitReasonX64ApicEoi.0 => {
-                //eprintln!("APIC EOI");
+                // Forward EOI to the IOAPIC so it can clear Remote IRR for
+                // level-triggered interrupts.  Without this the IOAPIC thinks
+                // the interrupt is still being serviced and coalesces (drops)
+                // all subsequent assertions on the same pin.
+                let vector = unsafe { exit_context.Anonymous.ApicEoi.InterruptVector };
+                if let Some(handler) = self.mmio_handlers.get_mut("ioapic") {
+                    // Write to the IOAPIC EOI register (offset 0x40) with the vector
+                    handler.handle_write(0x40, 4, vector as u64)?;
+                }
                 Ok(true)
             }
             x if x == WHvRunVpExitReasonX64Cpuid.0 => {

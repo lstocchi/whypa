@@ -136,61 +136,19 @@ fn main() -> anyhow::Result<()> {
     //eprintln!("MMIO handler registered!"); */
     
     // Register IOAPIC MMIO region
-    //eprintln!("\n=== Registering IOAPIC ===");
     use crate::memory::layout::IOAPIC_START;
+    use crate::devices::legacy::ioapic::{IoApic, IoApicMmioAdapter};
+    use crate::devices::legacy::irqchip::IrqChipDevice;
     const IOAPIC_BASE: u64 = IOAPIC_START.0;
-    const IOAPIC_REGION_SIZE: u64 = 0x100; // 256 bytes window (larger than actual IOAPIC for safety)
-    
-    
-    // Create a simple IOAPIC stub handler
-    struct IoapicStubHandler {
-        index_register: u32, // IOAPIC index register (at offset 0x00)
-    }
-    
-    impl MmioHandler for IoapicStubHandler {
-        fn handle_read(&self, offset: u64, size: u32) -> Result<u64> {
-            match offset {
-                0x00 => {
-                    // Index register - return current index
-                    Ok(self.index_register as u64)
-                }
-                0x10 => {
-                    match self.index_register {
-                        0x00 => Ok(0x0), // IOAPIC ID (can be 0)
-                        0x01 => {
-                            // VERSION REGISTER
-                            // Bits 0-7: Version (0x11 is standard)
-                            // Bits 16-23: Max Redirection Entry (N-1). 
-                            // Let's return 23, which means 24 pins (GSIs 0-23).
-                            let version = 0x11;
-                            let max_redir = 0x17; // 24 pins
-                            Ok(((max_redir << 16) | version) as u64)
-                        }
-                        _ => Ok(0),
-                    }
-                }
-                _ => Ok(0),
-            }
-        }
-        
-        fn handle_write(&mut self, offset: u64, size: u32, value: u64) -> Result<()> {
-            match offset {
-                0x00 => {
-                    // Index register - store the index
-                    self.index_register = value as u32;
-                }
-                0x10 => {
-                    // Data register - log important writes (redirection table entries)
-                    if self.index_register >= 0x10 && self.index_register <= 0x3F {
-                        //eprintln!("  [IOAPIC] Configuring GSI {}: 0x{:X}", (self.index_register - 0x10) / 2, value);
-                    }
-                }
-                _ => {}
-            }
-            Ok(())
-        }
-    }
-    
+    const IOAPIC_REGION_SIZE: u64 = 0x1000; // 4KB IOAPIC MMIO region
+
+    // Create the software IOAPIC backed by WHP interrupt injection
+    let ioapic = IoApic::new(partition.handle);
+    let ioapic_irqchip: crate::devices::legacy::irqchip::IrqChip = Arc::new(Mutex::new(
+        IrqChipDevice::new(Box::new(ioapic))
+    ));
+    let ioapic_mmio_adapter = IoApicMmioAdapter::new(ioapic_irqchip.clone());
+
     // Register IOAPIC MMIO region
     partition.register_mmio_region(
         IOAPIC_BASE,
@@ -198,13 +156,11 @@ fn main() -> anyhow::Result<()> {
         "IOAPIC".to_string(),
         Some("ioapic".to_string()),
     )?;
-    
-    // Register the IOAPIC handler
+
+    // Register the IOAPIC MMIO handler
     partition.register_mmio_handler(
         "ioapic".to_string(),
-        Box::new(IoapicStubHandler {
-            index_register: 0,
-        }),
+        Box::new(ioapic_mmio_adapter),
     );
 
     
@@ -279,19 +235,12 @@ fn main() -> anyhow::Result<()> {
         SyncMode::Full,
     )?));
     
-    // Create a simple IRQ chip for the virtio device
-    use crate::devices::legacy::{irqchip::IrqChipDevice, simple_irqchip::SimpleIrqChip};
-    let simple_irqchip = SimpleIrqChip::new(0, 0); // MMIO address/size not used for simple chip
-    let irqchip: crate::devices::legacy::irqchip::IrqChip = Arc::new(Mutex::new(
-        IrqChipDevice::new(Box::new(simple_irqchip))
-    ));
-    
-    // Create MMIO transport
+    // Create MMIO transport using the shared IOAPIC as the interrupt controller
     use crate::devices::virtio::mmio::MmioTransport;
     let mem_manager = partition.memory_manager().clone();
     let mut mmio_transport = MmioTransport::new(
         mem_manager,
-        irqchip,
+        ioapic_irqchip.clone(),
         block_device.clone(),
     )?;
     
@@ -333,13 +282,9 @@ fn main() -> anyhow::Result<()> {
     use crate::devices::virtio::rng::Rng;
     let rng_device = Arc::new(Mutex::new(Rng::new()));
 
-    let rng_irqchip: crate::devices::legacy::irqchip::IrqChip = Arc::new(Mutex::new(
-        IrqChipDevice::new(Box::new(SimpleIrqChip::new(0, 0)))
-    ));
-
     let mut rng_mmio_transport = MmioTransport::new(
         partition.memory_manager().clone(),
-        rng_irqchip,
+        ioapic_irqchip.clone(),
         rng_device.clone(),
     )?;
     rng_mmio_transport.set_irq_line(VIRTIO_RNG_IRQ);

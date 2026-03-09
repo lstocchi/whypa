@@ -162,6 +162,19 @@ impl InterruptTransport {
         self.try_signal(VIRTIO_MMIO_INT_CONFIG)
     }
 
+    /// De-assert the IRQ line on the interrupt controller, clearing the IOAPIC
+    /// IRR bit.  Called after InterruptAck drives the status register to zero.
+    pub fn try_clear_irq(&self) {
+        if let Err(e) = self
+            .intc()
+            .lock()
+            .unwrap()
+            .clear_irq(self.0.irq_line)
+        {
+            warn!("[{}] Failed to clear IRQ: {e:?}", self.0.log_target);
+        }
+    }
+
     pub fn signal_used_queue(&self) {
         if let Err(e) = self.try_signal_used_queue() {
             warn!("[{}] Failed to signal used queue: {e:?}", self.0.log_target);
@@ -490,9 +503,16 @@ impl BusDevice for MmioTransport {
                     }
                     0x64 => {
                         if self.check_device_status(device_status::DRIVER_OK, 0) {
-                            self.interrupt
+                            let prev = self.interrupt
                                 .status()
                                 .fetch_and(!(v as usize), Ordering::SeqCst);
+                            // If the interrupt status is now zero, de-assert the
+                            // IRQ line so the IOAPIC's IRR is cleared.  This
+                            // prevents level-triggered re-delivery on EOI when
+                            // the device has nothing more to report.
+                            if prev & !(v as usize) == 0 {
+                                self.interrupt.try_clear_irq();
+                            }
                         }
                     }
                     0x70 => self.set_device_status(v),

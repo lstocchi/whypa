@@ -38,12 +38,12 @@ pub fn load_linux_kernel<P: LinuxBootPartition>(
     
     //eprintln!("Loading Linux kernel from: {}", kernel_path);
 
-    let mut initram_data = Vec::new();
+    /* let mut initram_data = Vec::new();
     if !initram_path.is_empty() {
         let mut initramfd = File::open(initram_path)
             .with_context(|| format!("Failed to open initramfs file: {}", initram_path))?;
         initramfd.read_to_end(&mut initram_data)?;
-    }
+    } */
     
     let mut kernel_file = File::open(kernel_path)
         .map_err(|e| anyhow::anyhow!("Failed to open kernel file: {}", e))?;
@@ -114,7 +114,7 @@ pub fn load_linux_kernel<P: LinuxBootPartition>(
     let initrd_addr_max = boot_header.initrd_addr_max;
     
     let mut initram_address: u64 = 0;
-    let initram_size = initram_data.len();
+    /* let initram_size = initram_data.len();
     
     if !initram_data.is_empty() {
         // Pick a page-aligned address as high as possible below initrd_addr_max,
@@ -134,8 +134,9 @@ pub fn load_linux_kernel<P: LinuxBootPartition>(
         }
         
         partition.write_code(&initram_data, initram_address)?;
-    }
+    } */
     
+    let initram_size = 0;
     // Step 2: Set up boot parameters structure
     // init_size is stored in boot_params and will be read later when setting up paging
     let _init_size = setup_linux_boot_params(partition, BOOT_PARAMS_BASE, kernel_path, code32_start, initram_address, initram_size)?;
@@ -195,9 +196,9 @@ fn setup_linux_boot_params<P: LinuxBootPartition>(partition: &P, gpa: GuestAddre
 
     // Step 2: Tell the kernel about the initramfs via ramdisk_image / ramdisk_size
     // 0x218: ramdisk_image (u32) - GPA where the initramfs is loaded
-    boot_params[0x218..0x21C].copy_from_slice(&(initram_address as u32).to_le_bytes());
+    //boot_params[0x218..0x21C].copy_from_slice(&(initram_address as u32).to_le_bytes());
     // 0x21C: ramdisk_size (u32) - size of the initramfs in bytes
-    boot_params[0x21C..0x220].copy_from_slice(&(initram_size as u32).to_le_bytes());
+    //boot_params[0x21C..0x220].copy_from_slice(&(initram_size as u32).to_le_bytes());
 
     // 0x224: heap_end_ptr (u16)
     let heap_end: u16 = 0xFE00;

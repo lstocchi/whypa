@@ -50,25 +50,21 @@ impl MmioHandler for MmioTransportAdapter {
             _ => return Err(anyhow::anyhow!("Unsupported read size: {}", size)),
         };
         
-        // Log important virtio register accesses
+        // Log important virtio MMIO v2 register reads
         match offset {
             0x00 => eprintln!("  [Virtio] Read MagicValue: 0x{:X}", value),
             0x04 => eprintln!("  [Virtio] Read Version: 0x{:X}", value),
             0x08 => eprintln!("  [Virtio] Read DeviceID: 0x{:X}", value),
-            0x0C => eprintln!("  [Virtio] Read VendorID: 0x{:X}", value),
+            0x0c => eprintln!("  [Virtio] Read VendorID: 0x{:X}", value),
             0x10 => eprintln!("  [Virtio] Read DeviceFeatures: 0x{:X}", value),
-            0x14 => eprintln!("  [Virtio] Read DeviceFeaturesSel: 0x{:X}", value),
-            0x20 => eprintln!("  [Virtio] Read QueueSel: 0x{:X}", value),
-            0x24 => eprintln!("  [Virtio] Read QueueNumMax: 0x{:X}", value),
-            0x28 => eprintln!("  [Virtio] Read QueueNum: 0x{:X}", value),
-            0x30 => eprintln!("  [Virtio] Read QueueReady: 0x{:X}", value),
-            0x40 => eprintln!("  [Virtio] Read QueueNotify: 0x{:X}", value),
-            0x50 => eprintln!("  [Virtio] Read InterruptStatus: 0x{:X}", value),
-            0x60 => eprintln!("  [Virtio] Read Status: 0x{:X}", value),
+            0x34 => eprintln!("  [Virtio] Read QueueNumMax: 0x{:X}", value),
+            0x44 => eprintln!("  [Virtio] Read QueueReady: 0x{:X}", value),
+            0x60 => eprintln!("  [Virtio] Read InterruptStatus: 0x{:X}", value),
+            0x70 => eprintln!("  [Virtio] Read Status: 0x{:X}", value),
+            0xfc => eprintln!("  [Virtio] Read ConfigGeneration: 0x{:X}", value),
             _ => {
-                // Only log other reads if they're not common polling addresses
-                if offset >= 0x70 {
-                    eprintln!("  [Virtio] Read offset 0x{:X}: 0x{:X}", offset, value);
+                if offset >= 0x100 {
+                    eprintln!("  [Virtio] Read Config[0x{:X}]: 0x{:X}", offset - 0x100, value);
                 }
             }
         }
@@ -79,24 +75,27 @@ impl MmioHandler for MmioTransportAdapter {
     fn handle_write(&mut self, offset: u64, size: u32, value: u64) -> Result<()> {
         let mut transport = self.transport.lock().unwrap();
         
-        // Log important virtio register writes
+        // Log important virtio MMIO v2 register writes
         match offset {
             0x14 => eprintln!("  [Virtio] Write DeviceFeaturesSel: 0x{:X}", value),
-            0x20 => eprintln!("  [Virtio] Write QueueSel: 0x{:X}", value),
-            0x24 => eprintln!("  [Virtio] Write QueueNum: 0x{:X}", value),
-            0x28 => eprintln!("  [Virtio] Write QueueAlign: 0x{:X}", value),
-            0x30 => eprintln!("  [Virtio] Write QueueReady: 0x{:X}", value),
-            0x38 => eprintln!("  [Virtio] Write QueueDescLow: 0x{:X}", value),
-            0x3C => eprintln!("  [Virtio] Write QueueDescHigh: 0x{:X}", value),
-            0x40 => eprintln!("  [Virtio] Write QueueAvailLow: 0x{:X}", value),
-            0x44 => eprintln!("  [Virtio] Write QueueAvailHigh: 0x{:X}", value),
-            0x48 => eprintln!("  [Virtio] Write QueueUsedLow: 0x{:X}", value),
-            0x4C => eprintln!("  [Virtio] Write QueueUsedHigh: 0x{:X}", value),
-            0x50 => eprintln!("  [Virtio] Write InterruptAck: 0x{:X}", value),
-            0x64 => eprintln!("  [Virtio] Write Status: 0x{:X}", value),
+            0x20 => eprintln!("  [Virtio] Write DriverFeatures: 0x{:X}", value),
+            0x24 => eprintln!("  [Virtio] Write DriverFeaturesSel: 0x{:X}", value),
+            0x30 => eprintln!("  [Virtio] Write QueueSel: 0x{:X}", value),
+            0x38 => eprintln!("  [Virtio] Write QueueNum: 0x{:X}", value),
+            0x44 => eprintln!("  [Virtio] Write QueueReady: 0x{:X}", value),
+            0x50 => eprintln!("  [Virtio] Write QueueNotify: 0x{:X}", value),
+            0x64 => eprintln!("  [Virtio] Write InterruptAck: 0x{:X}", value),
+            0x70 => eprintln!("  [Virtio] Write Status: 0x{:X}", value),
+            0x80 => eprintln!("  [Virtio] Write QueueDescLow: 0x{:X}", value),
+            0x84 => eprintln!("  [Virtio] Write QueueDescHigh: 0x{:X}", value),
+            0x90 => eprintln!("  [Virtio] Write QueueAvailLow: 0x{:X}", value),
+            0x94 => eprintln!("  [Virtio] Write QueueAvailHigh: 0x{:X}", value),
+            0xa0 => eprintln!("  [Virtio] Write QueueUsedLow: 0x{:X}", value),
+            0xa4 => eprintln!("  [Virtio] Write QueueUsedHigh: 0x{:X}", value),
+            0xac => eprintln!("  [Virtio] Write SHMSel: 0x{:X}", value),
             _ => {
-                if offset >= 0x70 {
-                    eprintln!("  [Virtio] Write offset 0x{:X}: 0x{:X}", offset, value);
+                if offset >= 0x100 {
+                    eprintln!("  [Virtio] Write Config[0x{:X}]: 0x{:X}", offset - 0x100, value);
                 }
             }
         }
