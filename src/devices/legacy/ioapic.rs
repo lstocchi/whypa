@@ -12,9 +12,8 @@ use windows::Win32::System::Hypervisor::*;
 use crate::devices::bus::BusDevice;
 use crate::devices::event::WindowsEvent;
 use crate::devices::legacy::irqchip::{IrqChip, IrqChipT};
+use crate::memory::layout;
 use crate::partition::MmioHandler;
-
-const IOAPIC_BASE: u32 = 0xfec0_0000;
 const IOAPIC_NUM_PINS: usize = 24;
 
 // MMIO register offsets
@@ -241,11 +240,11 @@ impl IoApic {
 
 impl IrqChipT for IoApic {
     fn get_mmio_addr(&self) -> u64 {
-        IOAPIC_BASE as u64
+        layout::IOAPIC_START.0
     }
 
     fn get_mmio_size(&self) -> u64 {
-        0x1000
+        layout::IOAPIC_SIZE
     }
 
     fn set_irq(

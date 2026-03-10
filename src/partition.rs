@@ -11,7 +11,7 @@ use anyhow::Context;
 use std::{ffi::c_void, ptr};
 use std::fs;
 
-use crate::{cpu::CpuManager, device_manager::DeviceManager, emulator::{self, Emulator}, linux_boot::{self, LinuxBootPartition}, memory::{layout::{MEM_32BIT_DEVICES_START, MEM_32BIT_RESERVED_SIZE, MEM_32BIT_RESERVED_START, RAM_64BIT_START}, memory::{GuestAddress, MemoryAccessViolation, MemoryManager, MemoryPerms, MemoryRegion, MmioRegion}}};
+use crate::{cpu::CpuManager, device_manager::DeviceManager, emulator::{self, Emulator}, linux_boot::{self, LinuxBootPartition}, memory::{layout, memory::{GuestAddress, MemoryAccessViolation, MemoryManager, MemoryPerms, MemoryRegion, MmioRegion}}};
 use std::collections::HashMap;
 
 /// Trait for MMIO device handlers
@@ -185,7 +185,7 @@ impl Partition {
                 return Err(anyhow::anyhow!("Failed to allocate memory"));
             }
 
-            if total_memory <= MEM_32BIT_RESERVED_START.0 {
+            if total_memory <= layout::MEM_32BIT_RESERVED_START.0 {
                 WHvMapGpaRange(
                     self.handle,
                     source,
@@ -197,7 +197,7 @@ impl Partition {
                 self.memory.register_region(MemoryRegion::new(GuestAddress(0), total_memory, MemoryPerms::RWX, Some(source)));
             } else {
                 // Map the first 3GB
-                let low_size = MEM_32BIT_DEVICES_START.0;
+                let low_size = layout::MEM_32BIT_DEVICES_START.0;
 
                 WHvMapGpaRange(
                     self.handle,
@@ -209,7 +209,7 @@ impl Partition {
 
                 self.memory.register_region(MemoryRegion::new(GuestAddress(0), low_size, MemoryPerms::RWX, Some(source)));
 
-                let gpa = RAM_64BIT_START.0;
+                let gpa = layout::RAM_64BIT_START.0;
                 let size = total_memory - low_size;
                 let high_source = (source as *const u8).add(low_size as usize) as *mut c_void;
                 WHvMapGpaRange(
@@ -245,7 +245,6 @@ impl Partition {
     }
 
     /// Load Linux kernel and set up boot parameters using linux_loader
-    /// Kernel is loaded at 0x100000 (1MB), boot params at 0x10000 (64KB)
     pub fn load_linux_kernel(&mut self, kernel_path: &str, initram_path: &str, memory_size: u64) -> Result<u64> {
         linux_boot::load_linux_kernel(self, kernel_path, initram_path)
     }
@@ -284,8 +283,6 @@ impl Partition {
         Ok(())
     }
 
-    /// Set up registers for Linux kernel boot
-    /// RSI should point to boot_params (0x10000)
     /// Verify current RIP value (for debugging)
     pub fn verify_rip(&self, vp_id: u32) -> Result<u64> {
         unsafe {
@@ -306,8 +303,7 @@ impl Partition {
         let kernel_load_addr = kernel_entry;
         
         // Read init_size from boot_params (offset 0x260 in boot_params at BOOT_PARAMS_BASE)
-        use crate::linux_boot::BOOT_PARAMS_BASE;
-        let boot_params = self.read_memory(BOOT_PARAMS_BASE, 4096)?;
+        let boot_params = self.read_memory(layout::ZERO_PAGE_START, 4096)?;
         let init_size = if boot_params.len() > 0x260 + 4 {
             u32::from_le_bytes([
                 boot_params[0x260],
@@ -316,7 +312,7 @@ impl Partition {
                 boot_params[0x263],
             ])
         } else {
-            0x100000 // Default to 1MB if not available
+            layout::HIGH_RAM_START.0 as u32 // Default to 1MB if not available
         };
         
         linux_boot::setup_identity_paging(self, kernel_load_addr, init_size)?;

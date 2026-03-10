@@ -4,12 +4,9 @@ use std::fs::File;
 
 use crate::acpi::create_acpi_tables;
 use crate::memory::memory::GuestAddress;
+use crate::memory::layout;
 use crate::bootparam::setup_header;
 
-/// Linux boot constants
-const KERNEL_BASE: u64 = 0x100000; // 1MB - standard Linux kernel load address
-pub const BOOT_PARAMS_BASE: GuestAddress = GuestAddress(0x10000); // Zero page - boot parameters location
-const CMD_LINE_OFFSET: u64 = 0x1000; // Command line buffer location
 
 use crate::device_manager::DeviceManager;
 use crate::cpu::CpuManager;
@@ -27,7 +24,6 @@ pub trait LinuxBootPartition {
 }
 
 /// Load Linux kernel and set up boot parameters
-/// Kernel is loaded at 0x100000 (1MB), boot params at 0x10000 (64KB)
 pub fn load_linux_kernel<P: LinuxBootPartition>(
     partition: &P,
     kernel_path: &str,
@@ -93,10 +89,10 @@ pub fn load_linux_kernel<P: LinuxBootPartition>(
     let kernel_size = total_size - setup_size;
 
     let code32_start = boot_header.code32_start as u64;
-    let kernel_load_addr = if code32_start >= KERNEL_BASE {
+    let kernel_load_addr = if code32_start >= layout::HIGH_RAM_START.0 {
         code32_start
     } else {
-        KERNEL_BASE
+        layout::HIGH_RAM_START.0
     };
     
     //eprintln!("  bzImage header parsed:");
@@ -106,7 +102,7 @@ pub fn load_linux_kernel<P: LinuxBootPartition>(
     kernel_file.seek(SeekFrom::Start(setup_size as u64))?;
     let mut payload = Vec::new();
     kernel_file.read_to_end(&mut payload)?;
-    partition.write_code(&payload, KERNEL_BASE)?;
+    partition.write_code(&payload, layout::HIGH_RAM_START.0)?;
 
     // Step 1: Place initramfs in guest physical memory
     // Read initrd_addr_max from the kernel header (offset 0x22C in bzImage = field in setup_header)
@@ -139,10 +135,10 @@ pub fn load_linux_kernel<P: LinuxBootPartition>(
     let initram_size = 0;
     // Step 2: Set up boot parameters structure
     // init_size is stored in boot_params and will be read later when setting up paging
-    let _init_size = setup_linux_boot_params(partition, BOOT_PARAMS_BASE, kernel_path, code32_start, initram_address, initram_size)?;
+    let _init_size = setup_linux_boot_params(partition, layout::ZERO_PAGE_START, kernel_path, code32_start, initram_address, initram_size)?;
     
     // Kernel entry point is at kernel_load_addr + 0x200 (standard offset)
-    let kernel_entry = KERNEL_BASE + 0x200;
+    let kernel_entry = layout::HIGH_RAM_START.0 + 0x200;
     
     //eprintln!("  Kernel entry point: 0x{:X}", kernel_entry);
     Ok(kernel_entry as u64)
@@ -210,8 +206,7 @@ fn setup_linux_boot_params<P: LinuxBootPartition>(partition: &P, gpa: GuestAddre
     // virtio_mmio.device tells Linux to probe for a virtio-mmio device
     // Format: virtio_mmio.device=<size>@<baseaddr>:<irq>
     // Use the layout-defined address in the 32-bit reserved area (0xF8000000)
-    use crate::memory::layout::VIRTIO_MMIO_START;
-    let virtio_base = VIRTIO_MMIO_START.0;
+    let virtio_base = layout::VIRTIO_MMIO_START.0;
     let cmd_line = format!(
         "console=ttyS0 console=hvc0 root=/dev/vda rw init=/bin/sh"
     );//eprintln!("  Kernel command line: {}", cmd_line);
@@ -220,10 +215,8 @@ fn setup_linux_boot_params<P: LinuxBootPartition>(partition: &P, gpa: GuestAddre
     let mut cmd_line_vec = cmd_line_bytes.to_vec();
     cmd_line_vec.push(0);
 
-    let cmd_ptr = gpa.unchecked_add(CMD_LINE_OFFSET);
-
-    partition.write_code(&cmd_line_vec, cmd_ptr.0)?;
-    boot_params[0x228..0x22C].copy_from_slice(&(cmd_ptr.0 as u32).to_le_bytes());
+    partition.write_code(&cmd_line_vec, layout::CMDLINE_START.0)?;
+    boot_params[0x228..0x22C].copy_from_slice(&(layout::CMDLINE_START.0 as u32).to_le_bytes());
     
     for i in 0x1E0..0x1EF {
         boot_params[i] = 0;
@@ -236,7 +229,7 @@ fn setup_linux_boot_params<P: LinuxBootPartition>(partition: &P, gpa: GuestAddre
     // 0x2D0: e820_table - E820 memory map table (array of struct e820_entry)
     // Each entry is 20 bytes: addr (u64), size (u64), type (u32)
     // Type 1 = RAM, Type 2 = Reserved
-    let memory_size = partition.get_memory_size() - 0x100000;
+    let memory_size = partition.get_memory_size() - layout::HIGH_RAM_START.0;
     let mut offset = 0x2D0;
     let regions = partition.memory_manager().get_regions();
     for region in regions {
@@ -246,9 +239,8 @@ fn setup_linux_boot_params<P: LinuxBootPartition>(partition: &P, gpa: GuestAddre
     
     // Add the 32-bit reserved area as reserved memory in E820 table
     // This is the hole between low RAM (3GB) and high RAM (4GB)
-    use crate::memory::layout::{MEM_32BIT_RESERVED_START, MEM_32BIT_RESERVED_SIZE};
-    if partition.get_memory_size() > MEM_32BIT_RESERVED_START.0 {
-        write_e820(&mut boot_params, offset, MEM_32BIT_RESERVED_START.0, MEM_32BIT_RESERVED_SIZE, 2);
+    if partition.get_memory_size() > layout::MEM_32BIT_RESERVED_START.0 {
+        write_e820(&mut boot_params, offset, layout::MEM_32BIT_RESERVED_START.0, layout::MEM_32BIT_RESERVED_SIZE, 2);
         offset += 20;
     }
     
@@ -260,7 +252,7 @@ fn setup_linux_boot_params<P: LinuxBootPartition>(partition: &P, gpa: GuestAddre
     }
 
     let e820_count = regions.len() + 
-        (if partition.get_memory_size() > MEM_32BIT_RESERVED_START.0 { 1 } else { 0 }) +
+        (if partition.get_memory_size() > layout::MEM_32BIT_RESERVED_START.0 { 1 } else { 0 }) +
         mmio_regions.len();
     boot_params[0x1E8] = e820_count as u8;
     /* write_e820(&mut boot_params, offset, 0x0, 0x400, 1);
@@ -283,7 +275,6 @@ fn setup_linux_boot_params<P: LinuxBootPartition>(partition: &P, gpa: GuestAddre
     create_acpi_tables(partition.device_manager(), partition.cpu_manager(), partition.memory_manager());
     Ok(init_size)
 }
-const PAGE_TABLE_BASE: u64 = 0x9000; // Place tables starting at 36KB
 
 /// Set up identity paging for 64-bit boot protocol
 /// 
@@ -300,28 +291,29 @@ pub fn setup_identity_paging<P: LinuxBootPartition>(
     // Each table is 4096 bytes (512 entries each table - each entry is 8 bytes). Total = 8KB.
     let mut tables = vec![0u8; 4096 * 2];
 
-    // PML4[0] points to PDP (at PAGE_TABLE_BASE + 0x1000)
-    let pml4_entry = (PAGE_TABLE_BASE + 0x1000) | 0x3; // Present + Writable
+    // PML4[0] points to PDPTE
+    let pml4_entry = layout::PDPTE_START.0 | 0x3; // Present + Writable
     tables[0..8].copy_from_slice(&pml4_entry.to_le_bytes());
 
     // Calculate the maximum address we need to map
     // We need to map: kernel (kernel_load_addr + init_size), zero page (0x0), and command line buffer
     let kernel_end = kernel_load_addr + (init_size as u64);
-    let max_addr = kernel_end.max(0x10000); // At least map up to 64KB for zero page + command line
+    let max_addr = kernel_end.max(layout::CMDLINE_START.0 + layout::CMDLINE_MAX_SIZE as u64); // At least map up to command line end
     
     // Calculate how many 1GB PDP entries we need
     let pdp_entries_needed = ((max_addr + 0x3FFFFFFF) >> 30) as usize + 1; // Round up to next 1GB boundary
     //let pdp_entries = pdp_entries_needed.min(4); // Limit to 4GB for now
 
-    // PDP: Map entries to cover required range (each PDP entry covers 1GB)
+    // PDPTE: Map entries to cover required range (each entry covers 1GB)
+    let pdpte_offset = (layout::PDPTE_START.0 - layout::PML4_START.0) as usize;
     for i in 0..4 {
         let pdp_entry = ((i as u64) << 30) | 0x83; // Present + Writable + Page Size (1GB pages)
-        let offset = 0x1000 + (i * 8);
+        let offset = pdpte_offset + (i * 8);
         tables[offset..offset + 8].copy_from_slice(&pdp_entry.to_le_bytes());
     }
 
-    partition.write_code(&tables, PAGE_TABLE_BASE)?;
-    //eprintln!("  ✓ Identity paging written to 0x{:X} (mapping up to 0x{:X})", PAGE_TABLE_BASE, max_addr);
+    partition.write_code(&tables, layout::PML4_START.0)?;
+    //eprintln!("  ✓ Identity paging written to 0x{:X} (mapping up to 0x{:X})", layout::PML4_START.0, max_addr);
     Ok(())
 }
 
@@ -373,7 +365,7 @@ pub fn setup_linux_registers<P: LinuxBootPartition>(partition: &P, handle: WHV_P
             0x00AF9A000000FFFF,                    // __BOOT_CS (index 2, selector 0x10): 64-bit code, execute/read
             0x00CF93000000FFFF,                    // __BOOT_DS (index 3, selector 0x18): 64-bit data, read/write
         ];
-        partition.write_code(std::slice::from_raw_parts(gdt.as_ptr() as *const u8, 32), 0x500)?;
+        partition.write_code(std::slice::from_raw_parts(gdt.as_ptr() as *const u8, 32), layout::BOOT_GDT_START.0)?;
 
         let mut names = Vec::new();
         let mut values = Vec::new();
@@ -381,12 +373,12 @@ pub fn setup_linux_registers<P: LinuxBootPartition>(partition: &P, handle: WHV_P
         // --- GDTR ---
         names.push(WHvX64RegisterGdtr);
         values.push(WHV_REGISTER_VALUE {
-            Table: WHV_X64_TABLE_REGISTER { Base: 0x500, Limit: 31, ..Default::default() }, // 4 entries * 8 bytes - 1
+            Table: WHV_X64_TABLE_REGISTER { Base: layout::BOOT_GDT_START.0, Limit: 31, ..Default::default() }, // 4 entries * 8 bytes - 1
         });
 
         // --- Control Registers: 64-bit mode with paging enabled ---
         names.push(WHvX64RegisterCr3);  
-        values.push(WHV_REGISTER_VALUE { Reg64: PAGE_TABLE_BASE });
+        values.push(WHV_REGISTER_VALUE { Reg64: layout::PML4_START.0 });
         
         names.push(WHvX64RegisterCr4);  
         values.push(WHV_REGISTER_VALUE { Reg64: 0x20 }); // PAE (required for Long Mode)
@@ -433,11 +425,11 @@ pub fn setup_linux_registers<P: LinuxBootPartition>(partition: &P, handle: WHV_P
         
         // %rsi must hold the base address of the struct boot_params
         names.push(WHvX64RegisterRsi); 
-        values.push(WHV_REGISTER_VALUE { Reg64: BOOT_PARAMS_BASE.0 });
+        values.push(WHV_REGISTER_VALUE { Reg64: layout::ZERO_PAGE_START.0 });
         
         // RSP: Set stack pointer
         names.push(WHvX64RegisterRsp); 
-        values.push(WHV_REGISTER_VALUE { Reg64: 0x80000 });
+        values.push(WHV_REGISTER_VALUE { Reg64: layout::BOOT_STACK_POINTER.0 });
         
         // RFLAGS: Interrupt must be disabled (IF flag = 0)
         // RFLAGS = 0x2 (bit 1 = reserved, always 1; IF bit 9 = 0)
