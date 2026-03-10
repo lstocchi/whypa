@@ -11,18 +11,8 @@ use anyhow::Context;
 use std::{ffi::c_void, ptr};
 use std::fs;
 
-use crate::{cpu::CpuManager, device_manager::DeviceManager, emulator::{self, Emulator}, linux_boot::{self, LinuxBootPartition}, memory::{layout, memory::{GuestAddress, MemoryAccessViolation, MemoryManager, MemoryPerms, MemoryRegion, MmioRegion}}};
+use crate::{cpu::CpuManager, device_manager::DeviceManager, devices::bus::BusDevice, emulator::{self, Emulator}, linux_boot::{self, LinuxBootPartition}, memory::{layout, memory::{GuestAddress, MemoryAccessViolation, MemoryManager, MemoryPerms, MemoryRegion, MmioRegion}}};
 use std::collections::HashMap;
-
-/// Trait for MMIO device handlers
-pub trait MmioHandler: Send + Sync {
-    /// Handle an MMIO read access
-    /// Returns the value read from the device
-    fn handle_read(&self, offset: u64, size: u32) -> Result<u64>;
-    
-    /// Handle an MMIO write access
-    fn handle_write(&mut self, offset: u64, size: u32, value: u64) -> Result<()>;
-}
 
 pub struct Partition {
     pub handle: WHV_PARTITION_HANDLE,
@@ -32,7 +22,7 @@ pub struct Partition {
     memory: MemoryManager, // Memory debugging and tracking
     device_manager: DeviceManager, // Device management (PCI, serial, ACPI platform addresses)
     cpu_manager: CpuManager, // CPU management (ACPI MADT, CPU topology)
-    mmio_handlers: HashMap<String, Box<dyn MmioHandler>>, // MMIO device handlers by name
+    mmio_handlers: HashMap<String, Box<dyn BusDevice>>, // MMIO device handlers by name
     pub pci_address_config: u32,
 }
 
@@ -126,13 +116,8 @@ impl Partition {
         &mut self.memory
     }
 
-    /// Get a reference to MMIO handlers (for emulator callbacks)
-    pub(crate) fn mmio_handlers(&self) -> &HashMap<String, Box<dyn MmioHandler>> {
-        &self.mmio_handlers
-    }
-
     /// Get a mutable reference to MMIO handlers (for emulator callbacks)
-    pub(crate) fn mmio_handlers_mut(&mut self) -> &mut HashMap<String, Box<dyn MmioHandler>> {
+    pub(crate) fn mmio_handlers_mut(&mut self) -> &mut HashMap<String, Box<dyn BusDevice>> {
         &mut self.mmio_handlers
     }
 
@@ -395,13 +380,8 @@ impl Partition {
     }
     
     /// Register an MMIO handler
-    pub fn register_mmio_handler(&mut self, name: String, handler: Box<dyn MmioHandler>) {
+    pub fn register_mmio_handler(&mut self, name: String, handler: Box<dyn BusDevice>) {
         self.mmio_handlers.insert(name, handler);
-    }
-    
-    /// Get a mutable reference to an MMIO handler
-    pub fn get_mmio_handler_mut(&mut self, name: &str) -> Option<&mut Box<dyn MmioHandler>> {
-        self.mmio_handlers.get_mut(name)
     }
 
     pub fn setup_registers(&self, vp_id: u32, rip: u64) -> Result<()> {
@@ -800,7 +780,7 @@ impl Partition {
                 let vector = unsafe { exit_context.Anonymous.ApicEoi.InterruptVector };
                 if let Some(handler) = self.mmio_handlers.get_mut("ioapic") {
                     // Write to the IOAPIC EOI register (offset 0x40) with the vector
-                    handler.handle_write(0x40, 4, vector as u64)?;
+                    handler.write(0, 0x40, &(vector as u32).to_le_bytes());
                 }
                 Ok(true)
             }

@@ -238,78 +238,19 @@ impl Emulator {
                     let partition_mut = &mut *(context as *mut crate::partition::Partition);
                     
                     if let Some(handler) = partition_mut.mmio_handlers_mut().get_mut(handler_name) {
+                        let size = access_size as usize;
                         match direction {
                             0 => {
-                                // Read operation
-                                match handler.handle_read(offset, access_size) {
-                                    Ok(value) => {
-                                        // Set the data based on access size
-                                        // Data is [u8; 8], so we need to write bytes in little-endian order
-                                        let value_bytes = value.to_le_bytes();
-                                        match access_size {
-                                            1 => {
-                                                mem_info.Data[0] = value_bytes[0];
-                                            }
-                                            2 => {
-                                                mem_info.Data[0..2].copy_from_slice(&value_bytes[0..2]);
-                                            }
-                                            4 => {
-                                                mem_info.Data[0..4].copy_from_slice(&value_bytes[0..4]);
-                                            }
-                                            8 => {
-                                                mem_info.Data.copy_from_slice(&value_bytes);
-                                            }
-                                            _ => {
-                                                //eprintln!("[MMIO Emulator] Unsupported read size: {}", access_size);
-                                                return windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_INVALID_PARAMETER.0);
-                                            }
-                                        }
-                                        windows::core::HRESULT(0) // S_OK
-                                    }
-                                    Err(e) => {
-                                        //eprintln!("[MMIO Emulator] Handler read error: {:?}", e);
-                                        windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_INTERNAL_ERROR.0)
-                                    }
-                                }
+                                // Read – pass the emulator's data buffer directly
+                                handler.read(0, offset, &mut mem_info.Data[..size]);
+                                windows::core::HRESULT(0) // S_OK
                             }
                             1 => {
-                                // Write operation
-                                // Data is [u8; 8], read bytes in little-endian order
-                                let value = match access_size {
-                                    1 => mem_info.Data[0] as u64,
-                                    2 => u16::from_le_bytes([mem_info.Data[0], mem_info.Data[1]]) as u64,
-                                    4 => u32::from_le_bytes([
-                                        mem_info.Data[0],
-                                        mem_info.Data[1],
-                                        mem_info.Data[2],
-                                        mem_info.Data[3],
-                                    ]) as u64,
-                                    8 => u64::from_le_bytes([
-                                        mem_info.Data[0],
-                                        mem_info.Data[1],
-                                        mem_info.Data[2],
-                                        mem_info.Data[3],
-                                        mem_info.Data[4],
-                                        mem_info.Data[5],
-                                        mem_info.Data[6],
-                                        mem_info.Data[7],
-                                    ]),
-                                    _ => {
-                                        //eprintln!("[MMIO Emulator] Unsupported write size: {}", access_size);
-                                        return windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_INVALID_PARAMETER.0);
-                                    }
-                                };
-                                
-                                match handler.handle_write(offset, access_size, value) {
-                                    Ok(_) => windows::core::HRESULT(0), // S_OK
-                                    Err(e) => {
-                                        //eprintln!("[MMIO Emulator] Handler write error: {:?}", e);
-                                        windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_INTERNAL_ERROR.0)
-                                    }
-                                }
+                                // Write – pass the emulator's data buffer directly
+                                handler.write(0, offset, &mem_info.Data[..size]);
+                                windows::core::HRESULT(0) // S_OK
                             }
                             _ => {
-                                //eprintln!("[MMIO Emulator] Unknown direction: {}", direction);
                                 windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_INVALID_PARAMETER.0)
                             }
                         }

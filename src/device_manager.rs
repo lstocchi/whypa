@@ -6,17 +6,16 @@ use anyhow::Result;
 use tracing::{debug, info};
 
 use crate::acpi::{AcpiPlatformAddresses, AcpiPmTimerDevice};
-use crate::devices::bus::Bus;
+use crate::devices::bus::{Bus, BusDevice};
 use crate::devices::event::WindowsEvent;
 use crate::devices::legacy::ioapic::{IoApic, IoApicMmioAdapter};
 use crate::devices::legacy::irqchip::{IrqChip, IrqChipDevice};
 use crate::devices::virtio::block::{Block, CacheType, ImageType, SyncMode};
 use crate::devices::virtio::console::device::Console;
 use crate::devices::virtio::mmio::MmioTransport;
-use crate::devices::virtio::mmio_adapter::MmioTransportAdapter;
 use crate::devices::virtio::rng::Rng;
 use crate::memory::{layout, memory::GuestAddress};
-use crate::partition::{MmioHandler, Partition};
+use crate::partition::Partition;
 
 /// IRQ assignments for virtio devices.
 const VIRTIO_BLOCK_IRQ: u32 = 20;
@@ -85,14 +84,12 @@ fn setup_ioapic(partition: &mut Partition) -> Result<IrqChip> {
 /// (standard PCI "no device present" response) and ignores writes.
 struct PciEcamHandler;
 
-impl MmioHandler for PciEcamHandler {
-    fn handle_read(&self, _offset: u64, _size: u32) -> Result<u64> {
-        Ok(0xFFFFFFFF)
+impl BusDevice for PciEcamHandler {
+    fn read(&mut self, _vcpuid: u64, _offset: u64, data: &mut [u8]) {
+        // "No device present" – fill with 0xFF
+        data.fill(0xFF);
     }
-
-    fn handle_write(&mut self, _offset: u64, _size: u32, _value: u64) -> Result<()> {
-        Ok(())
-    }
+    fn write(&mut self, _vcpuid: u64, _offset: u64, _data: &[u8]) {}
 }
 
 /// Register the PCI ECAM (memory-mapped config space) stub so that PCI
@@ -153,15 +150,13 @@ fn setup_virtio_block(
     )?;
     transport.set_irq_line(VIRTIO_BLOCK_IRQ);
 
-    let adapter = MmioTransportAdapter::new(transport);
-
     partition.register_mmio_region(
         base,
         size,
         "Virtio Block Device".to_string(),
         Some("virtio_block".to_string()),
     )?;
-    partition.register_mmio_handler("virtio_block".to_string(), Box::new(adapter));
+    partition.register_mmio_handler("virtio_block".to_string(), Box::new(transport));
     partition.device_manager_mut().register_virtio_mmio(
         "VBLK".to_string(), 1, base, size, VIRTIO_BLOCK_IRQ,
     );
@@ -189,15 +184,13 @@ fn setup_virtio_rng(partition: &mut Partition, irqchip: &IrqChip) -> Result<()> 
     )?;
     transport.set_irq_line(VIRTIO_RNG_IRQ);
 
-    let adapter = MmioTransportAdapter::new(transport);
-
     partition.register_mmio_region(
         base,
         size,
         "Virtio RNG Device".to_string(),
         Some("virtio_rng".to_string()),
     )?;
-    partition.register_mmio_handler("virtio_rng".to_string(), Box::new(adapter));
+    partition.register_mmio_handler("virtio_rng".to_string(), Box::new(transport));
     partition.device_manager_mut().register_virtio_mmio(
         "VRNG".to_string(), 2, base, size, VIRTIO_RNG_IRQ,
     );
@@ -232,15 +225,13 @@ fn setup_virtio_console(
     )?;
     transport.set_irq_line(VIRTIO_CONSOLE_IRQ);
 
-    let adapter = MmioTransportAdapter::new(transport);
-
     partition.register_mmio_region(
         base,
         size,
         "Virtio Console Device".to_string(),
         Some("virtio_console".to_string()),
     )?;
-    partition.register_mmio_handler("virtio_console".to_string(), Box::new(adapter));
+    partition.register_mmio_handler("virtio_console".to_string(), Box::new(transport));
     partition.device_manager_mut().register_virtio_mmio(
         "VCON".to_string(), 3, base, size, VIRTIO_CONSOLE_IRQ,
     );

@@ -16,7 +16,6 @@ mod device;
 mod descriptor_utils;
 mod bindings;
 pub mod block;
-pub mod mmio_adapter;
 pub mod rng;
 pub mod console;
 

@@ -13,7 +13,6 @@ use crate::devices::bus::BusDevice;
 use crate::devices::event::WindowsEvent;
 use crate::devices::legacy::irqchip::{IrqChip, IrqChipT};
 use crate::memory::layout;
-use crate::partition::MmioHandler;
 const IOAPIC_NUM_PINS: usize = 24;
 
 // MMIO register offsets
@@ -438,7 +437,7 @@ impl BusDevice for IoApic {
     }
 }
 
-/// Adapter that wraps an IrqChip (containing IoApic) to implement MmioHandler
+/// Adapter that wraps an IrqChip (containing IoApic) to implement BusDevice
 /// for the partition's MMIO dispatch system.
 pub struct IoApicMmioAdapter {
     irqchip: IrqChip,
@@ -450,30 +449,12 @@ impl IoApicMmioAdapter {
     }
 }
 
-impl MmioHandler for IoApicMmioAdapter {
-    fn handle_read(&self, offset: u64, size: u32) -> anyhow::Result<u64> {
-        let mut data = vec![0u8; size as usize];
-        self.irqchip.lock().unwrap().read(0, offset, &mut data);
-
-        let value = match size {
-            1 => data[0] as u64,
-            2 => u16::from_ne_bytes([data[0], data[1]]) as u64,
-            4 => u32::from_ne_bytes([data[0], data[1], data[2], data[3]]) as u64,
-            _ => return Err(anyhow::anyhow!("ioapic: unsupported read size: {}", size)),
-        };
-
-        Ok(value)
+impl BusDevice for IoApicMmioAdapter {
+    fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
+        self.irqchip.lock().unwrap().read(0, offset, data);
     }
 
-    fn handle_write(&mut self, offset: u64, size: u32, value: u64) -> anyhow::Result<()> {
-        let data = match size {
-            1 => vec![value as u8],
-            2 => (value as u16).to_ne_bytes().to_vec(),
-            4 => (value as u32).to_ne_bytes().to_vec(),
-            _ => return Err(anyhow::anyhow!("ioapic: unsupported write size: {}", size)),
-        };
-
-        self.irqchip.lock().unwrap().write(0, offset, &data);
-        Ok(())
+    fn write(&mut self, _vcpuid: u64, offset: u64, data: &[u8]) {
+        self.irqchip.lock().unwrap().write(0, offset, data);
     }
 }
