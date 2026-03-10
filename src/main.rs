@@ -20,7 +20,7 @@ use tracing_subscriber::filter::LevelFilter;
 use anyhow::Context;
 use anyhow::Result;
 use std::collections::VecDeque;
-use std::io::BufRead;
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 use crate::devices::event::WindowsEvent;
@@ -49,6 +49,34 @@ fn install_tracing() {
         .init();
 }
 
+
+/// Strip Cursor Position Report responses (`ESC[row;colR`) from raw bytes.
+///
+/// The host terminal generates these in response to DSR queries (`ESC[6n`)
+/// that the guest shell sends.  If they leak into the guest's stdin they
+/// appear as garbage text like `^[[30;5R`.
+fn strip_cpr_responses(bytes: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look for ESC [ <digits and semicolons> R
+        if bytes[i] == 0x1b && i + 2 < bytes.len() && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            // Consume digits and semicolons (the row;col part)
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            // If we consumed at least one char and it ends with 'R', it's a CPR
+            if j > i + 2 && j < bytes.len() && bytes[j] == b'R' {
+                i = j + 1; // skip the entire CPR sequence
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    result
+}
 
 static mut PM_TICK: u32 = 0;
 fn main() -> anyhow::Result<()> {
@@ -323,6 +351,47 @@ fn main() -> anyhow::Result<()> {
     const VIRTIO_CONSOLE_IRQ: u32 = 22;
 
 
+    // ── Put the host console into raw mode ───────────────────────────
+    // The guest's TTY driver will handle echoing and line editing;
+    // if the host also echoes we get every character printed twice.
+    use windows::Win32::System::Console::{
+        GetConsoleMode, SetConsoleMode, GetStdHandle,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+        ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
+        ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    };
+
+    let saved_console_mode: Option<(windows::Win32::Foundation::HANDLE, CONSOLE_MODE)> = unsafe {
+        let h_stdin = GetStdHandle(STD_INPUT_HANDLE).ok();
+        if let Some(h) = h_stdin {
+            let mut mode = CONSOLE_MODE::default();
+            if GetConsoleMode(h, &mut mode).is_ok() {
+                let saved = mode;
+                // Strip echo and line-edit flags; keep window-input & extended flags
+                let raw = (mode & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT))
+                    | ENABLE_VIRTUAL_TERMINAL_INPUT;
+                let _ = SetConsoleMode(h, raw);
+                Some((h, saved))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    // Enable VT processing on stdout so ANSI escape sequences from the
+    // guest render correctly on the Windows console.
+    unsafe {
+        if let Some(h) = GetStdHandle(STD_OUTPUT_HANDLE).ok() {
+            let mut mode = CONSOLE_MODE::default();
+            if GetConsoleMode(h, &mut mode).is_ok() {
+                let _ = SetConsoleMode(h, mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+        }
+    }
+
     let worker_input_buffer: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
     let worker_input_event = Arc::new(WindowsEvent::new().unwrap());
 
@@ -331,18 +400,23 @@ fn main() -> anyhow::Result<()> {
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
         let mut handle = stdin.lock();
+        let mut buf = [0u8; 256];
         loop {
-            let mut buffer = String::new();
-            match handle.read_line(&mut buffer) {
+            match handle.read(&mut buf) {
+                Ok(0) => break, // EOF
                 Ok(n) => {
-                    if n == 0 {
-                        break;
+                    // Filter out any CPR (Cursor Position Report) responses
+                    // that the host terminal may have injected into stdin.
+                    // These look like ESC[row;colR and would confuse the guest.
+                    let filtered = strip_cpr_responses(&buf[..n]);
+                    if !filtered.is_empty() {
+                        stdin_input_buffer.lock().unwrap().extend(&filtered);
+                        stdin_input_event.signal();
                     }
-                    stdin_input_buffer.lock().unwrap().extend(buffer.as_bytes());
-                    stdin_input_event.signal();
                 }
                 Err(e) => {
                     error!("Error reading stdin: {}", e);
+                    break;
                 }
             }
         }
@@ -465,6 +539,11 @@ fn main() -> anyhow::Result<()> {
         //Ok(())
         tokio::signal::ctrl_c().await.unwrap();
     });
+
+    // Restore original console mode so the shell behaves normally after exit.
+    if let Some((h, saved)) = saved_console_mode {
+        unsafe { let _ = SetConsoleMode(h, saved); }
+    }
 
     //eprintln!("VM partition deleted");
 

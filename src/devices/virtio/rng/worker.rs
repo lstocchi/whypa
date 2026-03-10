@@ -136,7 +136,7 @@ impl RngWorker {
                 0
             };
 
-            tracing::info!("virtio_rng: request len={}, written={}", len, written);
+            //tracing::info!("virtio_rng: request len={}, written={}", len, written);
 
             if let Err(e) = self.device_queue.queue.add_used(mem, head.index, written as u32) {
                 error!("virtio_rng: failed to add used: {e:?}");

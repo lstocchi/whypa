@@ -134,9 +134,14 @@ impl ConsoleWorker {
                 let mut buf = vec![0u8; avail];
                 match reader.read(&mut buf) {
                     Ok(n) => {
-                        // Write guest output to host stdout.
-                        let _ = io::stdout().write_all(&buf[..n]);
-                        let _ = io::stdout().flush();
+                        // Strip DSR queries (ESC[6n) from guest output so the
+                        // host terminal does not generate CPR responses that
+                        // leak back into the guest as garbage input.
+                        let filtered = self.filter_dsr_and_respond(&buf[..n]);
+                        if !filtered.is_empty() {
+                            let _ = io::stdout().write_all(&filtered);
+                            let _ = io::stdout().flush();
+                        }
                     }
                     Err(e) => {
                         error!("virtio_console tx: failed to read from descriptor: {e:?}");
@@ -161,6 +166,43 @@ impl ConsoleWorker {
                 error!("virtio_console tx: failed to signal queue: {e:?}");
             }
         }
+    }
+
+    // ── DSR / CPR filtering ─────────────────────────────────────────
+
+    /// Scan `buf` for DSR queries (`ESC[6n`).  Every occurrence is stripped
+    /// from the returned bytes, and a synthetic CPR response (`ESC[1;1R`)
+    /// is injected into the guest's receive path so the shell's line editor
+    /// doesn't hang waiting for a reply.
+    fn filter_dsr_and_respond(&self, buf: &[u8]) -> Vec<u8> {
+        const DSR: &[u8] = b"\x1b[6n";
+        let mut result = Vec::with_capacity(buf.len());
+        let mut i = 0;
+        let mut found = false;
+
+        while i < buf.len() {
+            if i + DSR.len() <= buf.len() && &buf[i..i + DSR.len()] == DSR {
+                found = true;
+                i += DSR.len();
+            } else {
+                result.push(buf[i]);
+                i += 1;
+            }
+        }
+
+        if found {
+            // Inject a synthetic Cursor Position Report: row 1, col 1.
+            // The guest shell uses this to learn where the prompt ends.
+            // Row/col 1;1 is a safe default; the shell will re-query if
+            // it needs a more precise value after further output.
+            let cpr = b"\x1b[1;1R";
+            if let Ok(mut input_buf) = self.input_buffer.lock() {
+                input_buf.extend(cpr.iter().copied());
+            }
+            let _ = self.input_event.signal();
+        }
+
+        result
     }
 
     // ── receiveq processing (input from host → guest) ──────────────
