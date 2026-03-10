@@ -18,6 +18,7 @@ mod bindings;
 pub mod block;
 pub mod mmio_adapter;
 pub mod rng;
+pub mod console;
 
 /// When the driver initializes the device, it lets the device know about the
 /// completed stages using the Device Status Field.
@@ -40,6 +41,7 @@ mod device_status {
 /// Type 0 is not used by virtio. Use it as wildcard for non-virtio devices
 pub const TYPE_NET: u32 = 1;
 pub const TYPE_BLOCK: u32 = 2;
+pub const TYPE_CONSOLE: u32 = 3;
 pub const TYPE_RNG: u32 = 4;
 
 /// Interrupt flags (re: interrupt status & acknowledge registers).

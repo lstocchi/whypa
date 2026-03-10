@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::Write;
 
 use windows::Win32::System::{
     Hypervisor::*,
@@ -95,20 +95,17 @@ impl Emulator {
                 // IN instruction - read data
                 match port {
                     0x3F8 => {
-                        // Read a character from stdin
-                        let mut buf = [0u8; 1];
-                        match std::io::stdin().read(&mut buf) {
-                            Ok(1) => io_info.Data = buf[0] as u32,
-                            _ => io_info.Data = 0,
-                        }
+                        // Read data register — return 0 (no data available).
+                        // A blocking stdin().read() here would freeze the entire VM.
+                        io_info.Data = 0;
                     }
                     0x3FD => {
-                        // LSR - check if input is available
-                        let mut status: u32 = 0x60; // TX always ready
-                        // Set bit 0 (Data Ready) if stdin has data
-                        // Simple approach: always say data is ready
-                        status |= 0x01;
-                        io_info.Data = status;
+                        // LSR (Line Status Register)
+                        // Bit 0 = Data Ready (DR)  — only set when we actually have buffered input
+                        // Bit 5 = Transmitter Holding Register Empty (THRE)
+                        // Bit 6 = Transmitter Empty (TEMT)
+                        // Return 0x60: TX ready, no data available for reading.
+                        io_info.Data = 0x60;
                     }
                     0x3F9 => {
                         io_info.Data = SERIAL_IER as u32;
@@ -158,12 +155,6 @@ impl Emulator {
                         let function = (partition.pci_address_config  >> 8) & 0x7;
                         let reg = (partition.pci_address_config >> 2) & 0x3F;
                         ////eprintln!("PCI Scan: Kernel is checking Bus {}, Device {}, function {}, register {}. Returning 0xFFFFFFFF", bus, dev, function, reg);
-                    }
-                    0x3FD => {
-                        // Bit 5 = Transmitter Holding Register Empty
-                        // Bit 6 = Transmitter Empty
-                        // We return 0x60 to tell the kernel: "I'm ready to receive characters!"
-                        io_info.Data = 0x60;
                     }
                     _ => {
                         // Try the IO bus for registered devices (e.g. ACPI PM Timer at 0x608)

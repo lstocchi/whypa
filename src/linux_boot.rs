@@ -213,7 +213,7 @@ fn setup_linux_boot_params<P: LinuxBootPartition>(partition: &P, gpa: GuestAddre
     use crate::memory::layout::VIRTIO_MMIO_START;
     let virtio_base = VIRTIO_MMIO_START.0;
     let cmd_line = format!(
-        "console=ttyS0 root=/dev/vda rw init=/bin/sh"
+        "console=ttyS0 console=hvc0 root=/dev/vda rw init=/bin/sh"
     );//eprintln!("  Kernel command line: {}", cmd_line);
     let cmd_line_bytes = cmd_line.as_bytes();
 

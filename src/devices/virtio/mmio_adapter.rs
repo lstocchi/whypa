@@ -51,7 +51,7 @@ impl MmioHandler for MmioTransportAdapter {
         };
         
         // Log important virtio MMIO v2 register reads
-        match offset {
+       /*  match offset {
             0x00 => eprintln!("  [Virtio] Read MagicValue: 0x{:X}", value),
             0x04 => eprintln!("  [Virtio] Read Version: 0x{:X}", value),
             0x08 => eprintln!("  [Virtio] Read DeviceID: 0x{:X}", value),
@@ -67,7 +67,7 @@ impl MmioHandler for MmioTransportAdapter {
                     eprintln!("  [Virtio] Read Config[0x{:X}]: 0x{:X}", offset - 0x100, value);
                 }
             }
-        }
+        } */
         
         Ok(value)
     }
@@ -76,7 +76,7 @@ impl MmioHandler for MmioTransportAdapter {
         let mut transport = self.transport.lock().unwrap();
         
         // Log important virtio MMIO v2 register writes
-        match offset {
+        /* match offset {
             0x14 => eprintln!("  [Virtio] Write DeviceFeaturesSel: 0x{:X}", value),
             0x20 => eprintln!("  [Virtio] Write DriverFeatures: 0x{:X}", value),
             0x24 => eprintln!("  [Virtio] Write DriverFeaturesSel: 0x{:X}", value),
@@ -98,7 +98,7 @@ impl MmioHandler for MmioTransportAdapter {
                     eprintln!("  [Virtio] Write Config[0x{:X}]: 0x{:X}", offset - 0x100, value);
                 }
             }
-        }
+        } */
         
         // Convert value to bytes based on size
         let data = match size {

@@ -15,10 +15,16 @@ mod byte_order;
 use partition::{Partition, MmioHandler};
 use memory::memory::MemoryPerms;
 use tracing::debug;
+use tracing::error;
 use tracing_subscriber::filter::LevelFilter;
 use anyhow::Context;
 use anyhow::Result;
+use std::collections::VecDeque;
+use std::io::BufRead;
 use std::sync::{Arc, Mutex};
+
+use crate::devices::event::WindowsEvent;
+use crate::devices::virtio::console::device::Console;
 
 /// Install and configure the tracing/logging system.
 fn install_tracing() {
@@ -313,6 +319,55 @@ fn main() -> anyhow::Result<()> {
     
     let kernel_entry: u64;
     
+    const VIRTIO_CONSOLE_MMIO_BASE: u64 = VIRTIO_RNG_MMIO_BASE + VIRTIO_MMIO_SIZE;
+    const VIRTIO_CONSOLE_IRQ: u32 = 22;
+
+
+    let worker_input_buffer: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let worker_input_event = Arc::new(WindowsEvent::new().unwrap());
+
+    let stdin_input_buffer = Arc::clone(&worker_input_buffer);
+    let stdin_input_event = Arc::clone(&worker_input_event);
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        loop {
+            let mut buffer = String::new();
+            match handle.read_line(&mut buffer) {
+                Ok(n) => {
+                    if n == 0 {
+                        break;
+                    }
+                    stdin_input_buffer.lock().unwrap().extend(buffer.as_bytes());
+                    stdin_input_event.signal();
+                }
+                Err(e) => {
+                    error!("Error reading stdin: {}", e);
+                }
+            }
+        }
+    });
+
+    let console_device = Arc::new(Mutex::new(Console::new(200, 200, worker_input_buffer, worker_input_event)));
+    let mut console_mmio_transport = MmioTransport::new(
+        partition.memory_manager().clone(),
+        ioapic_irqchip.clone(),
+        console_device.clone(),
+    )?;
+    console_mmio_transport.set_irq_line(VIRTIO_CONSOLE_IRQ);
+    let console_mmio_adapter = MmioTransportAdapter::new(console_mmio_transport);
+    partition.register_mmio_region(VIRTIO_CONSOLE_MMIO_BASE, VIRTIO_MMIO_SIZE, "Virtio Console Device".to_string(), Some("virtio_console".to_string()))?;
+    partition.register_mmio_handler(
+        "virtio_console".to_string(),
+        Box::new(console_mmio_adapter),
+    );
+    partition.device_manager_mut().register_virtio_mmio(
+        "VCON".to_string(),
+        3,
+        VIRTIO_CONSOLE_MMIO_BASE,
+        VIRTIO_MMIO_SIZE,
+        VIRTIO_CONSOLE_IRQ,
+    );
    
     // Boot Linux kernel
     //eprintln!("\n=== Booting Linux Kernel ===");
