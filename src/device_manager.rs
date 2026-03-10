@@ -1,8 +1,258 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use acpi_tables::{Aml, aml, sdt::GenericAddress};
+use anyhow::Result;
+use tracing::{debug, info};
 
-use crate::{acpi::{AcpiPlatformAddresses, AcpiPmTimerDevice}, devices::bus::Bus, memory::{layout, memory::GuestAddress}};
+use crate::acpi::{AcpiPlatformAddresses, AcpiPmTimerDevice};
+use crate::devices::bus::Bus;
+use crate::devices::event::WindowsEvent;
+use crate::devices::legacy::ioapic::{IoApic, IoApicMmioAdapter};
+use crate::devices::legacy::irqchip::{IrqChip, IrqChipDevice};
+use crate::devices::virtio::block::{Block, CacheType, ImageType, SyncMode};
+use crate::devices::virtio::console::device::Console;
+use crate::devices::virtio::mmio::MmioTransport;
+use crate::devices::virtio::mmio_adapter::MmioTransportAdapter;
+use crate::devices::virtio::rng::Rng;
+use crate::memory::{layout, memory::GuestAddress};
+use crate::partition::{MmioHandler, Partition};
+
+/// IRQ assignments for virtio devices.
+const VIRTIO_BLOCK_IRQ: u32 = 20;
+const VIRTIO_RNG_IRQ: u32 = 21;
+const VIRTIO_CONSOLE_IRQ: u32 = 22;
+
+// ===========================================================================
+// Device registration – wires up all devices on the partition
+// ===========================================================================
+
+/// Register all devices on the partition: IOAPIC, PCI ECAM stub, and virtio
+/// devices (block, rng, console).
+pub fn register_devices(
+    partition: &mut Partition,
+    rootfs_path: &str,
+    input_buffer: Arc<Mutex<VecDeque<u8>>>,
+    input_event: Arc<WindowsEvent>,
+) -> Result<()> {
+    info!("Registering devices");
+
+    let irqchip = setup_ioapic(partition)?;
+    setup_pci_ecam(partition)?;
+    setup_virtio_block(partition, &irqchip, rootfs_path)?;
+    setup_virtio_rng(partition, &irqchip)?;
+    setup_virtio_console(partition, &irqchip, input_buffer, input_event)?;
+
+    info!("All devices registered");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// IOAPIC
+// ---------------------------------------------------------------------------
+
+/// Create the software IOAPIC, register its MMIO region, and return the
+/// [`IrqChip`] handle so it can be shared with virtio transports.
+fn setup_ioapic(partition: &mut Partition) -> Result<IrqChip> {
+    let ioapic = IoApic::new(partition.handle);
+    let irqchip: IrqChip = Arc::new(Mutex::new(
+        IrqChipDevice::new(Box::new(ioapic)),
+    ));
+    let mmio_adapter = IoApicMmioAdapter::new(irqchip.clone());
+
+    partition.register_mmio_region(
+        layout::IOAPIC_START.0,
+        layout::IOAPIC_SIZE,
+        "IOAPIC".to_string(),
+        Some("ioapic".to_string()),
+    )?;
+    partition.register_mmio_handler(
+        "ioapic".to_string(),
+        Box::new(mmio_adapter),
+    );
+
+    debug!(base = format_args!("0x{:X}", layout::IOAPIC_START.0),
+           size = format_args!("0x{:X}", layout::IOAPIC_SIZE),
+           "IOAPIC registered");
+    Ok(irqchip)
+}
+
+// ---------------------------------------------------------------------------
+// PCI ECAM stub
+// ---------------------------------------------------------------------------
+
+/// PCI ECAM stub handler – returns `0xFFFF_FFFF` for all config-space reads
+/// (standard PCI "no device present" response) and ignores writes.
+struct PciEcamHandler;
+
+impl MmioHandler for PciEcamHandler {
+    fn handle_read(&self, _offset: u64, _size: u32) -> Result<u64> {
+        Ok(0xFFFFFFFF)
+    }
+
+    fn handle_write(&mut self, _offset: u64, _size: u32, _value: u64) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Register the PCI ECAM (memory-mapped config space) stub so that PCI
+/// enumeration reads return "no device" instead of faulting.
+fn setup_pci_ecam(partition: &mut Partition) -> Result<()> {
+    partition.register_mmio_region(
+        layout::PCI_MMCONFIG_START.0,
+        layout::PCI_MMCONFIG_SIZE,
+        "PCI ECAM".to_string(),
+        Some("pci_ecam".to_string()),
+    )?;
+    partition.register_mmio_handler(
+        "pci_ecam".to_string(),
+        Box::new(PciEcamHandler),
+    );
+
+    debug!(base = format_args!("0x{:X}", layout::PCI_MMCONFIG_START.0),
+           size = format_args!("0x{:X}", layout::PCI_MMCONFIG_SIZE),
+           "PCI ECAM stub registered");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Virtio block device
+// ---------------------------------------------------------------------------
+
+/// Register the virtio block device backed by `rootfs_path`.
+fn setup_virtio_block(
+    partition: &mut Partition,
+    irqchip: &IrqChip,
+    rootfs_path: &str,
+) -> Result<()> {
+    let base = layout::VIRTIO_MMIO_START.0;
+    let size = layout::VIRTIO_MMIO_SIZE_PER_DEVICE;
+
+    // Create a default disk image when one doesn't exist yet.
+    if !std::fs::metadata(rootfs_path).is_ok() {
+        info!(path = rootfs_path, "Creating 1 GiB disk image");
+        let file = std::fs::File::create(rootfs_path)?;
+        file.set_len(1024 * 1024 * 1024)?; // 1 GiB
+    }
+
+    let block_device = Arc::new(Mutex::new(Block::new(
+        "vda1".to_string(),
+        None,
+        CacheType::Writeback,
+        rootfs_path.to_string(),
+        ImageType::Raw,
+        false,
+        false,
+        SyncMode::Full,
+    )?));
+
+    let mut transport = MmioTransport::new(
+        partition.memory_manager().clone(),
+        irqchip.clone(),
+        block_device,
+    )?;
+    transport.set_irq_line(VIRTIO_BLOCK_IRQ);
+
+    let adapter = MmioTransportAdapter::new(transport);
+
+    partition.register_mmio_region(
+        base,
+        size,
+        "Virtio Block Device".to_string(),
+        Some("virtio_block".to_string()),
+    )?;
+    partition.register_mmio_handler("virtio_block".to_string(), Box::new(adapter));
+    partition.device_manager_mut().register_virtio_mmio(
+        "VBLK".to_string(), 1, base, size, VIRTIO_BLOCK_IRQ,
+    );
+
+    debug!(base = format_args!("0x{:X}", base), irq = VIRTIO_BLOCK_IRQ,
+           path = rootfs_path, "Virtio block device registered");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Virtio RNG device
+// ---------------------------------------------------------------------------
+
+/// Register the virtio entropy (RNG) device.
+fn setup_virtio_rng(partition: &mut Partition, irqchip: &IrqChip) -> Result<()> {
+    let base = layout::VIRTIO_MMIO_START.0 + layout::VIRTIO_MMIO_SIZE_PER_DEVICE;
+    let size = layout::VIRTIO_MMIO_SIZE_PER_DEVICE;
+
+    let rng_device = Arc::new(Mutex::new(Rng::new()));
+
+    let mut transport = MmioTransport::new(
+        partition.memory_manager().clone(),
+        irqchip.clone(),
+        rng_device,
+    )?;
+    transport.set_irq_line(VIRTIO_RNG_IRQ);
+
+    let adapter = MmioTransportAdapter::new(transport);
+
+    partition.register_mmio_region(
+        base,
+        size,
+        "Virtio RNG Device".to_string(),
+        Some("virtio_rng".to_string()),
+    )?;
+    partition.register_mmio_handler("virtio_rng".to_string(), Box::new(adapter));
+    partition.device_manager_mut().register_virtio_mmio(
+        "VRNG".to_string(), 2, base, size, VIRTIO_RNG_IRQ,
+    );
+
+    debug!(base = format_args!("0x{:X}", base), irq = VIRTIO_RNG_IRQ,
+           "Virtio RNG device registered");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Virtio console device
+// ---------------------------------------------------------------------------
+
+/// Register the virtio console device wired to the host's stdin/stdout.
+fn setup_virtio_console(
+    partition: &mut Partition,
+    irqchip: &IrqChip,
+    input_buffer: Arc<Mutex<VecDeque<u8>>>,
+    input_event: Arc<WindowsEvent>,
+) -> Result<()> {
+    let base = layout::VIRTIO_MMIO_START.0 + 2 * layout::VIRTIO_MMIO_SIZE_PER_DEVICE;
+    let size = layout::VIRTIO_MMIO_SIZE_PER_DEVICE;
+
+    let console_device = Arc::new(Mutex::new(
+        Console::new(200, 200, input_buffer, input_event),
+    ));
+
+    let mut transport = MmioTransport::new(
+        partition.memory_manager().clone(),
+        irqchip.clone(),
+        console_device,
+    )?;
+    transport.set_irq_line(VIRTIO_CONSOLE_IRQ);
+
+    let adapter = MmioTransportAdapter::new(transport);
+
+    partition.register_mmio_region(
+        base,
+        size,
+        "Virtio Console Device".to_string(),
+        Some("virtio_console".to_string()),
+    )?;
+    partition.register_mmio_handler("virtio_console".to_string(), Box::new(adapter));
+    partition.device_manager_mut().register_virtio_mmio(
+        "VCON".to_string(), 3, base, size, VIRTIO_CONSOLE_IRQ,
+    );
+
+    debug!(base = format_args!("0x{:X}", base), irq = VIRTIO_CONSOLE_IRQ,
+           "Virtio console device registered");
+    Ok(())
+}
+
+// ===========================================================================
+// DeviceManager – tracks devices for ACPI table generation & IO bus dispatch
+// ===========================================================================
 
 pub struct DeviceManager {
     io_bus: Arc<Mutex<Bus>>,
@@ -138,7 +388,6 @@ impl Aml for VirtioMmioDevice {
             format!("_SB_.{}", self.name).as_str().into(),
             vec![
                 &aml::Name::new("_HID".into(), &"LNRO0005"),
-                //&aml::Name::new("_HID".into(), &"LNXP0567"),
                 &aml::Name::new("_UID".into(), &self.uid),
                 &aml::Name::new("_CRS".into(), &aml::ResourceTemplate::new(vec![
                     &aml::Memory32Fixed::new(
@@ -212,13 +461,6 @@ impl DeviceManager {
         let pm_timer_device = Arc::new(Mutex::new(AcpiPmTimerDevice::new()));
 
         let pm_timer_pio_address: u16 = 0x608;
-
-            /* self.address_manager
-                .allocator
-                .lock()
-                .unwrap()
-                .allocate_io_addresses(Some(GuestAddress(pm_timer_pio_address.into())), 0x4, None)
-                .ok_or(DeviceManagerError::AllocateIoPort)?; */
 
             let _ = self.io_bus
                 .lock()
