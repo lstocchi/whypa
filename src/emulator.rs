@@ -10,7 +10,6 @@ static mut DUMMY_RTC_TIME: u64 = 0;
 static mut DUMMY_RTC_COUNTER: u64 = 0;
 
 static mut REFRESH_BIT: u8 = 0;
-static mut SERIAL_IER: u8 = 0; // Interrupt Enable Register - Port 0x3F9
 
 pub struct Emulator {
     pub handle: *mut std::ffi::c_void,
@@ -65,19 +64,6 @@ impl Emulator {
                 // OUT instruction - write data
                 let data = io_info.Data;
                 match port {
-                    0x3F8 | 0x2F8 | 0x3E8 | 0x2E8 | 0x652 | 42 => {
-                        ////eprintln!("Serial port write: 0x{:X}, size: {}, port: 0x{:X}", data, access_size, port);
-                        // Serial ports - output character
-                        let data_out = std::slice::from_raw_parts(
-                            &data as *const u32 as *const u8,
-                            access_size as usize,
-                        );
-                        let _ = std::io::stdout().write(data_out);
-                        let _ = std::io::stdout().flush();
-                    }
-                    0x3F9 => {
-                        SERIAL_IER = io_info.Data as u8;
-                    }
                     0xCF8 => {
                         // MMIO port - write data
                         partition.pci_address_config = data;
@@ -94,22 +80,6 @@ impl Emulator {
             } else {
                 // IN instruction - read data
                 match port {
-                    0x3F8 => {
-                        // Read data register — return 0 (no data available).
-                        // A blocking stdin().read() here would freeze the entire VM.
-                        io_info.Data = 0;
-                    }
-                    0x3FD => {
-                        // LSR (Line Status Register)
-                        // Bit 0 = Data Ready (DR)  — only set when we actually have buffered input
-                        // Bit 5 = Transmitter Holding Register Empty (THRE)
-                        // Bit 6 = Transmitter Empty (TEMT)
-                        // Return 0x60: TX ready, no data available for reading.
-                        io_info.Data = 0x60;
-                    }
-                    0x3F9 => {
-                        io_info.Data = SERIAL_IER as u32;
-                    }
                     43 => {
                         // Specific port for testing
                         io_info.Data = 99;

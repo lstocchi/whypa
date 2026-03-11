@@ -407,14 +407,7 @@ impl DeviceManager {
                     end_of_mem64_area: 0x3fff_ffff_ffff,
                 }, // for local VM, 1 segment is enough
             ],
-            serial_devices: vec![
-                SerialDevice {
-                    name: "COM1".to_string(),
-                    uid: 1,
-                    irq: 4,
-                    port: 0x3f8,
-                },
-            ],
+            serial_devices: vec![],
             virtio_mmio_devices: Vec::new(),
             acpi_platform_addresses: AcpiPlatformAddresses::new(),
         }
