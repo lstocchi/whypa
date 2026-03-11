@@ -386,7 +386,7 @@ fn fill_boot_params<P: LinuxBootPartition>(
 
     // 0x228: cmd_line_ptr (u32)
     let cmd_line = format!(
-        "console=hvc0 8250.nr_uarts=0 root=/dev/vda rw init=/bin/sh loglevel=1"
+        "console=hvc0 8250.nr_uarts=0 root=/dev/vda rw loglevel=1"
     );
     let mut cmd_line_vec = cmd_line.as_bytes().to_vec();
     cmd_line_vec.push(0);
