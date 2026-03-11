@@ -81,7 +81,6 @@ fn main() -> anyhow::Result<()> {
     let kernel_entry = partition.load_linux_kernel(
         &cfg.kernel_path,
         &cfg.initram_path,
-        cfg.memory_size as u64,
     )?;
     partition.setup_linux_registers(0, kernel_entry)?;
     info!(entry = format_args!("0x{:X}", kernel_entry), "Kernel loaded, starting VM");
