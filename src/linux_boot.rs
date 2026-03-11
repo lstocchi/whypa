@@ -1,6 +1,8 @@
-use anyhow::{Result, Context};
+use anyhow::Result;
 use windows::Win32::System::Hypervisor::*;
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use tracing::info;
 
 use crate::acpi::create_acpi_tables;
 use crate::memory::memory::GuestAddress;
@@ -11,6 +13,49 @@ use crate::bootparam::setup_header;
 use crate::device_manager::DeviceManager;
 use crate::cpu::CpuManager;
 use crate::memory::memory::MemoryManager;
+
+/// ELF64 magic: \x7fELF
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+
+/// ELF constants
+const ELFCLASS64: u8 = 2;
+const ELFDATA2LSB: u8 = 1; // Little-endian
+const EM_X86_64: u16 = 62;
+const PT_LOAD: u32 = 1;
+
+/// Minimal ELF64 file header (64 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct Elf64Ehdr {
+    e_ident: [u8; 16],
+    e_type: u16,
+    e_machine: u16,
+    e_version: u32,
+    e_entry: u64,
+    e_phoff: u64,
+    e_shoff: u64,
+    e_flags: u32,
+    e_ehsize: u16,
+    e_phentsize: u16,
+    e_phnum: u16,
+    e_shentsize: u16,
+    e_shnum: u16,
+    e_shstrndx: u16,
+}
+
+/// Minimal ELF64 program header (56 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct Elf64Phdr {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_paddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
+}
 
 /// Trait for partition operations needed for Linux boot
 pub trait LinuxBootPartition {
@@ -23,36 +68,45 @@ pub trait LinuxBootPartition {
     fn memory_manager(&self) -> &MemoryManager;
 }
 
-/// Load Linux kernel and set up boot parameters
+/// Detect kernel format and load accordingly.
 pub fn load_linux_kernel<P: LinuxBootPartition>(
     partition: &P,
     kernel_path: &str,
     initram_path: &str,
 ) -> Result<u64> {
-    use std::fs::File;
-    use std::io::{Read, Seek, SeekFrom};
-    
-    //eprintln!("Loading Linux kernel from: {}", kernel_path);
-
-    /* let mut initram_data = Vec::new();
-    if !initram_path.is_empty() {
-        let mut initramfd = File::open(initram_path)
-            .with_context(|| format!("Failed to open initramfs file: {}", initram_path))?;
-        initramfd.read_to_end(&mut initram_data)?;
-    } */
-    
     let mut kernel_file = File::open(kernel_path)
         .map_err(|e| anyhow::anyhow!("Failed to open kernel file: {}", e))?;
-    
+
+    // Read first 4 bytes to detect format
+    let mut magic = [0u8; 4];
+    kernel_file.read_exact(&mut magic)?;
+    kernel_file.seek(SeekFrom::Start(0))?;
+
+    if magic == ELF_MAGIC {
+        info!("Detected ELF kernel image");
+        load_elf_kernel(partition, kernel_path, &mut kernel_file, initram_path)
+    } else {
+        info!("Detected bzImage kernel");
+        load_bzimage_kernel(partition, kernel_path, &mut kernel_file, initram_path)
+    }
+}
+
+/// Load a bzImage format kernel (original path).
+fn load_bzimage_kernel<P: LinuxBootPartition>(
+    partition: &P,
+    kernel_path: &str,
+    kernel_file: &mut File,
+    _initram_path: &str,
+) -> Result<u64> {
     // Get total file size
-    let mut total_size = kernel_file
+    let total_size = kernel_file
         .seek(SeekFrom::End(0))
         .map_err(|e| anyhow::anyhow!("Failed to seek to end: {}", e))? as usize;
 
     // Read boot header (setup_header structure) -> https://www.kernel.org/doc/Documentation/x86/boot.rst
     // The setup_header starts at offset 0x1f1 in the kernel image
     kernel_file.seek(SeekFrom::Start(0x1f1))?;
-    
+
     // Read the struct as bytes (size is 123 bytes according to bindgen test)
     let mut boot_header = setup_header::default();
     unsafe {
@@ -62,12 +116,6 @@ pub fn load_linux_kernel<P: LinuxBootPartition>(
         );
         kernel_file.read_exact(header_bytes)?;
     }
-    // Key fields we need:
-    // - offset 0x1F1: setup_sects (u8) - number of setup sectors
-    // - offset 0x202: header (magic "HdrS" = 0x53726448)
-    // - offset 0x206: version (u16) 
-    // - offset 0x211: loadflags (u8)
-    // - offset 0x214: code32_start (u32) - kernel load address
 
     // Copy the field to avoid unaligned access (packed struct)
     let header_magic = boot_header.header;
@@ -86,62 +134,163 @@ pub fn load_linux_kernel<P: LinuxBootPartition>(
     }
     setup_size = (setup_size + 1) * 512;
 
-    let kernel_size = total_size - setup_size;
+    let _kernel_size = total_size - setup_size;
 
     let code32_start = boot_header.code32_start as u64;
-    let kernel_load_addr = if code32_start >= layout::HIGH_RAM_START.0 {
-        code32_start
-    } else {
-        layout::HIGH_RAM_START.0
-    };
-    
-    //eprintln!("  bzImage header parsed:");
-    //eprintln!("    Kernel size: {} bytes", kernel_size);
-    //eprintln!("    Kernel load address: 0x{:X}", kernel_load_addr);
 
     kernel_file.seek(SeekFrom::Start(setup_size as u64))?;
     let mut payload = Vec::new();
     kernel_file.read_to_end(&mut payload)?;
     partition.write_code(&payload, layout::HIGH_RAM_START.0)?;
 
-    // Step 1: Place initramfs in guest physical memory
-    // Read initrd_addr_max from the kernel header (offset 0x22C in bzImage = field in setup_header)
-    // This is the highest physical address where the initramfs end may be placed.
-    let initrd_addr_max = boot_header.initrd_addr_max;
-    
-    let mut initram_address: u64 = 0;
-    /* let initram_size = initram_data.len();
-    
-    if !initram_data.is_empty() {
-        // Pick a page-aligned address as high as possible below initrd_addr_max,
-        // but also within the guest's physical memory.
-        let max_addr = (initrd_addr_max as u64 + 1).min(partition.get_memory_size());
-        let kernel_end = KERNEL_BASE + kernel_size as u64;
-        
-        // Align initramfs start down to page boundary (4KB)
-        initram_address = (max_addr - initram_size as u64) & !0xFFF;
-        
-        // Sanity check: must not overlap with the kernel
-        if initram_address < kernel_end {
-            return Err(anyhow::anyhow!(
-                "Not enough memory to place initramfs: need 0x{:X} but kernel ends at 0x{:X}, initrd_addr_max=0x{:X}",
-                initram_size, kernel_end, initrd_addr_max
-            ));
-        }
-        
-        partition.write_code(&initram_data, initram_address)?;
-    } */
-    
+    let initram_address: u64 = 0;
     let initram_size = 0;
-    // Step 2: Set up boot parameters structure
-    // init_size is stored in boot_params and will be read later when setting up paging
-    let _init_size = setup_linux_boot_params(partition, layout::ZERO_PAGE_START, kernel_path, code32_start, initram_address, initram_size)?;
-    
-    // Kernel entry point is at kernel_load_addr + 0x200 (standard offset)
+
+    // Set up boot parameters structure (reads setup_header from file)
+    let _init_size = setup_bzimage_boot_params(partition, layout::ZERO_PAGE_START, kernel_path, code32_start, initram_address, initram_size)?;
+
+    // Kernel entry point is at HIGH_RAM_START + 0x200 (standard offset for bzImage)
     let kernel_entry = layout::HIGH_RAM_START.0 + 0x200;
-    
-    //eprintln!("  Kernel entry point: 0x{:X}", kernel_entry);
     Ok(kernel_entry as u64)
+}
+
+/// Load an ELF64 format kernel.
+fn load_elf_kernel<P: LinuxBootPartition>(
+    partition: &P,
+    kernel_path: &str,
+    kernel_file: &mut File,
+    _initram_path: &str,
+) -> Result<u64> {
+    // Read ELF header
+    let mut ehdr = Elf64Ehdr::default();
+    unsafe {
+        let buf = std::slice::from_raw_parts_mut(
+            &mut ehdr as *mut Elf64Ehdr as *mut u8,
+            std::mem::size_of::<Elf64Ehdr>(),
+        );
+        kernel_file.read_exact(buf)?;
+    }
+
+    // Validate ELF header
+    if ehdr.e_ident[0..4] != ELF_MAGIC {
+        return Err(anyhow::anyhow!("Not a valid ELF file"));
+    }
+    if ehdr.e_ident[4] != ELFCLASS64 {
+        return Err(anyhow::anyhow!("Not a 64-bit ELF (class={})", ehdr.e_ident[4]));
+    }
+    if ehdr.e_ident[5] != ELFDATA2LSB {
+        return Err(anyhow::anyhow!("Not a little-endian ELF"));
+    }
+    if ehdr.e_machine != EM_X86_64 {
+        return Err(anyhow::anyhow!("Not an x86_64 ELF (machine={})", ehdr.e_machine));
+    }
+
+    let entry = ehdr.e_entry;
+    info!(entry = format_args!("0x{:X}", entry), phnum = ehdr.e_phnum, "Parsed ELF header");
+
+    // Read program headers
+    let phdr_size = std::mem::size_of::<Elf64Phdr>();
+    if ehdr.e_phentsize as usize != phdr_size {
+        return Err(anyhow::anyhow!(
+            "Unexpected phentsize: {} (expected {})", ehdr.e_phentsize, phdr_size
+        ));
+    }
+
+    kernel_file.seek(SeekFrom::Start(ehdr.e_phoff))?;
+    let mut phdrs = vec![Elf64Phdr::default(); ehdr.e_phnum as usize];
+    unsafe {
+        let buf = std::slice::from_raw_parts_mut(
+            phdrs.as_mut_ptr() as *mut u8,
+            phdr_size * ehdr.e_phnum as usize,
+        );
+        kernel_file.read_exact(buf)?;
+    }
+
+    // Load each PT_LOAD segment into guest physical memory.
+    // Track the vaddr→paddr delta from the first PT_LOAD so we can convert
+    // e_entry (a virtual address) into a guest physical address.
+    let mut lowest_paddr: u64 = u64::MAX;
+    let mut highest_end: u64 = 0;
+    let mut vaddr_to_paddr_offset: Option<i64> = None; // vaddr - paddr
+
+    for (i, phdr) in phdrs.iter().enumerate() {
+        if phdr.p_type != PT_LOAD {
+            continue;
+        }
+
+        let load_addr = phdr.p_paddr;
+        let mem_size = phdr.p_memsz;
+        let file_size = phdr.p_filesz;
+        let file_offset = phdr.p_offset;
+
+        // Capture the vaddr/paddr relationship from the first PT_LOAD segment
+        if vaddr_to_paddr_offset.is_none() {
+            vaddr_to_paddr_offset = Some(phdr.p_vaddr.wrapping_sub(phdr.p_paddr) as i64);
+        }
+
+        info!(
+            segment = i,
+            vaddr = format_args!("0x{:X}", phdr.p_vaddr),
+            paddr = format_args!("0x{:X}", load_addr),
+            filesz = format_args!("0x{:X}", file_size),
+            memsz = format_args!("0x{:X}", mem_size),
+            "Loading ELF PT_LOAD segment"
+        );
+
+        // Read segment data from file
+        if file_size > 0 {
+            kernel_file.seek(SeekFrom::Start(file_offset))?;
+            let mut data = vec![0u8; file_size as usize];
+            kernel_file.read_exact(&mut data)?;
+            partition.write_code(&data, load_addr)?;
+        }
+
+        // If memsz > filesz, the remainder is BSS (zero-filled).
+        // Guest memory is already zeroed, so we only need to write the file data.
+
+        lowest_paddr = lowest_paddr.min(load_addr);
+        highest_end = highest_end.max(load_addr + mem_size);
+    }
+
+    if lowest_paddr == u64::MAX {
+        return Err(anyhow::anyhow!("ELF has no PT_LOAD segments"));
+    }
+
+    // Determine the physical entry point.
+    // e_entry may be a virtual address (e.g. 0xFFFFFFFF81000000) or already
+    // a physical one (e.g. 0x1000000).  Check whether it falls inside any
+    // PT_LOAD segment's physical range first; if so, use it as-is.
+    // Otherwise, translate it using the vaddr→paddr delta.
+    let entry_is_physical = phdrs.iter().any(|ph| {
+        ph.p_type == PT_LOAD
+            && entry >= ph.p_paddr
+            && entry < ph.p_paddr + ph.p_memsz
+    });
+
+    let phys_entry = if entry_is_physical {
+        entry
+    } else {
+        let vaddr_offset = vaddr_to_paddr_offset.unwrap_or(0);
+        (entry as i64).wrapping_sub(vaddr_offset) as u64
+    };
+
+    let kernel_size = highest_end - lowest_paddr;
+    info!(
+        load_range = format_args!("0x{:X}..0x{:X}", lowest_paddr, highest_end),
+        size = format_args!("0x{:X}", kernel_size),
+        elf_entry = format_args!("0x{:X}", entry),
+        phys_entry = format_args!("0x{:X}", phys_entry),
+        translated = !entry_is_physical,
+        "ELF kernel loaded"
+    );
+
+    // Set up boot parameters for the ELF kernel
+    let code32_start = lowest_paddr;
+    let initram_address: u64 = 0;
+    let initram_size: usize = 0;
+    setup_elf_boot_params(partition, layout::ZERO_PAGE_START, code32_start, kernel_size, initram_address, initram_size)?;
+
+    Ok(phys_entry)
 }
 
 fn write_e820(boot_params: &mut [u8], offset: usize, mem_addr: u64, mem_size: u64, mem_type: u32) {
@@ -150,20 +299,11 @@ fn write_e820(boot_params: &mut [u8], offset: usize, mem_addr: u64, mem_size: u6
     boot_params[offset+16..offset+20].copy_from_slice(&mem_type.to_le_bytes());
 }
 
-/// Set up Linux boot parameters structure according to 64-bit boot protocol
-/// 
-/// In 64-bit boot protocol:
-/// 1. Allocate memory for struct boot_params (zero page) and initialize to all zero
-/// 2. Load the setup header at offset 0x01f1 of kernel image into struct boot_params
-/// 3. The end of setup header is calculated as: 0x0202 + byte value at offset 0x0201
-/// 4. Fill additional fields of struct boot_params as described in Zero Page chapter
-/// 
-/// Returns the init_size value from the setup header
-fn setup_linux_boot_params<P: LinuxBootPartition>(partition: &P, gpa: GuestAddress, kernel_path: &str, code32_start: u64, initram_address: u64, initram_size: usize) -> Result<u32> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    //eprintln!("  Setting up Linux boot parameters at 0x{:X} with code32_start 0x{:X}", gpa.raw_value(), code32_start);
-    
+/// Set up Linux boot parameters for a bzImage kernel.
+///
+/// Reads the setup_header from the bzImage file and copies it into the zero page.
+/// Returns the init_size value from the setup header.
+fn setup_bzimage_boot_params<P: LinuxBootPartition>(partition: &P, gpa: GuestAddress, kernel_path: &str, code32_start: u64, initram_address: u64, initram_size: usize) -> Result<u32> {
     // 1. Allocate and initialize boot_params to all zero (as per 64-bit boot protocol)
     let mut boot_params = vec![0u8; 4096];
     let mut f = std::fs::File::open(kernel_path)?;
@@ -177,103 +317,120 @@ fn setup_linux_boot_params<P: LinuxBootPartition>(partition: &P, gpa: GuestAddre
     let setup_header_end = 0x0202 + (setup_header_size_byte[0] as usize);
     let setup_header_size = setup_header_end - 0x1f1;
 
-    // 2. Load the header into the Zero Page
+    // Load the header into the Zero Page
     f.seek(SeekFrom::Start(0x1f1))?;
     f.read_exact(&mut boot_params[0x1f1..0x1f1 + setup_header_size])?;
-       
+
+    // Fill common boot_params fields and write to guest memory
+    fill_boot_params(partition, &mut boot_params, gpa, code32_start, initram_address, initram_size)?;
+
+    // Read init_size from setup header (offset 0x260 in boot_params)
+    let init_size = u32::from_le_bytes([
+        boot_params[0x260], boot_params[0x261],
+        boot_params[0x262], boot_params[0x263]
+    ]);
+
+    Ok(init_size)
+}
+
+/// Set up Linux boot parameters for an ELF kernel.
+///
+/// Since ELF files don't contain a bzImage setup_header, we construct a minimal
+/// one with the fields the kernel expects.
+/// Returns the init_size (derived from the kernel's total memory footprint).
+fn setup_elf_boot_params<P: LinuxBootPartition>(partition: &P, gpa: GuestAddress, code32_start: u64, kernel_size: u64, initram_address: u64, initram_size: usize) -> Result<u32> {
+    let mut boot_params = vec![0u8; 4096];
+
+    // Construct a minimal setup_header in the zero page.
+    // 0x1F1: setup_sects = 0 (no real-mode setup code)
+    boot_params[0x1F1] = 0;
+
+    // 0x202: header magic "HdrS"
+    boot_params[0x202..0x206].copy_from_slice(b"HdrS");
+
+    // 0x206: version = 0x020F (modern boot protocol)
+    boot_params[0x206..0x208].copy_from_slice(&0x020Fu16.to_le_bytes());
+
+    // 0x260: init_size - use the kernel's total memory size (rounded up to page boundary)
+    let init_size = ((kernel_size + 0xFFF) & !0xFFF) as u32;
+    boot_params[0x260..0x264].copy_from_slice(&init_size.to_le_bytes());
+
+    // Fill common boot_params fields and write to guest memory
+    fill_boot_params(partition, &mut boot_params, gpa, code32_start, initram_address, initram_size)?;
+
+    Ok(init_size)
+}
+
+/// Fill the common boot_params fields shared by both bzImage and ELF paths,
+/// then write the finished zero page into guest memory.
+fn fill_boot_params<P: LinuxBootPartition>(
+    partition: &P,
+    boot_params: &mut Vec<u8>,
+    gpa: GuestAddress,
+    code32_start: u64,
+    _initram_address: u64,
+    _initram_size: usize,
+) -> Result<()> {
     // 0x210: type_of_loader. MUST be non-zero (0xFF = custom)
     boot_params[0x210] = 0xFF;
 
     // 0x211: loadflags. bit 0 (Loaded High) + bit 7 (Heap)
-    boot_params[0x211] |= 0x81; 
-    
+    boot_params[0x211] |= 0x81;
+
     // 0x214: code32_start (u32) - kernel load address
     boot_params[0x214..0x218].copy_from_slice(&(code32_start as u32).to_le_bytes());
-
-    // Step 2: Tell the kernel about the initramfs via ramdisk_image / ramdisk_size
-    // 0x218: ramdisk_image (u32) - GPA where the initramfs is loaded
-    //boot_params[0x218..0x21C].copy_from_slice(&(initram_address as u32).to_le_bytes());
-    // 0x21C: ramdisk_size (u32) - size of the initramfs in bytes
-    //boot_params[0x21C..0x220].copy_from_slice(&(initram_size as u32).to_le_bytes());
 
     // 0x224: heap_end_ptr (u16)
     let heap_end: u16 = 0xFE00;
     boot_params[0x224..0x226].copy_from_slice(&heap_end.to_le_bytes());
 
-    // 0x228: cmd_line_ptr (u32). Point to a null terminator at the end of the page.
-    // lpj stands for "Loops Per Jiffy" - it is needed bc Fast TSC calibration failed
-    // 2000000 is a safe, standard value for modern virtualized CPUs
-    // virtio_mmio.device tells Linux to probe for a virtio-mmio device
-    // Format: virtio_mmio.device=<size>@<baseaddr>:<irq>
-    // Use the layout-defined address in the 32-bit reserved area (0xF8000000)
-    let virtio_base = layout::VIRTIO_MMIO_START.0;
+    // 0x228: cmd_line_ptr (u32)
     let cmd_line = format!(
         "console=ttyS0 console=hvc0 root=/dev/vda rw init=/bin/sh"
-    );//eprintln!("  Kernel command line: {}", cmd_line);
-    let cmd_line_bytes = cmd_line.as_bytes();
-
-    let mut cmd_line_vec = cmd_line_bytes.to_vec();
+    );
+    let mut cmd_line_vec = cmd_line.as_bytes().to_vec();
     cmd_line_vec.push(0);
 
     partition.write_code(&cmd_line_vec, layout::CMDLINE_START.0)?;
     boot_params[0x228..0x22C].copy_from_slice(&(layout::CMDLINE_START.0 as u32).to_le_bytes());
-    
+
     for i in 0x1E0..0x1EF {
         boot_params[i] = 0;
     }
-    // 0x1E8: e820_entries (u8) - Number of entries in e820_table
-    // NOTE: This is at offset 0x1E8, NOT 0x1E0 (which is alt_mem_k)
-    
+
+    // Ensure "HdrS" magic is present (may already be set by caller)
     boot_params[0x202..0x206].copy_from_slice(b"HdrS");
 
-    // 0x2D0: e820_table - E820 memory map table (array of struct e820_entry)
-    // Each entry is 20 bytes: addr (u64), size (u64), type (u32)
-    // Type 1 = RAM, Type 2 = Reserved
-    let memory_size = partition.get_memory_size() - layout::HIGH_RAM_START.0;
+    // E820 memory map
     let mut offset = 0x2D0;
     let regions = partition.memory_manager().get_regions();
     for region in regions {
-        write_e820(&mut boot_params, offset, region.start_addr().raw_value(), region.len(), 1);
+        write_e820(boot_params, offset, region.start_addr().raw_value(), region.len(), 1);
         offset += 20;
     }
-    
+
     // Add the 32-bit reserved area as reserved memory in E820 table
-    // This is the hole between low RAM (3GB) and high RAM (4GB)
     if partition.get_memory_size() > layout::MEM_32BIT_RESERVED_START.0 {
-        write_e820(&mut boot_params, offset, layout::MEM_32BIT_RESERVED_START.0, layout::MEM_32BIT_RESERVED_SIZE, 2);
+        write_e820(boot_params, offset, layout::MEM_32BIT_RESERVED_START.0, layout::MEM_32BIT_RESERVED_SIZE, 2);
         offset += 20;
     }
-    
-    // Add individual MMIO regions as reserved so they don't conflict with PCI resource claims
+
+    // Add individual MMIO regions as reserved
     let mmio_regions = partition.memory_manager().get_mmio_regions();
     for region in mmio_regions {
-        write_e820(&mut boot_params, offset, region.gpa.0, region.size, 2);
+        write_e820(boot_params, offset, region.gpa.0, region.size, 2);
         offset += 20;
     }
 
-    let e820_count = regions.len() + 
-        (if partition.get_memory_size() > layout::MEM_32BIT_RESERVED_START.0 { 1 } else { 0 }) +
-        mmio_regions.len();
+    let e820_count = regions.len()
+        + (if partition.get_memory_size() > layout::MEM_32BIT_RESERVED_START.0 { 1 } else { 0 })
+        + mmio_regions.len();
     boot_params[0x1E8] = e820_count as u8;
-    /* write_e820(&mut boot_params, offset, 0x0, 0x400, 1);
-    write_e820(&mut boot_params, offset + 20, 0x400, 0x9FC00, 1);
-    write_e820(&mut boot_params, offset + 40, 0x100000, memory_size, 1);*/
-    
 
-
-    // Read init_size from setup header (offset 0x260 in boot_params)
-    // init_size is a u32 that specifies the size of the kernel initialization code
-    let init_size = u32::from_le_bytes([
-        boot_params[0x260], boot_params[0x261], 
-        boot_params[0x262], boot_params[0x263]
-    ]);
-
-    partition.write_code(&boot_params, gpa.0)?;
-    //eprintln!("  ✓ Boot parameters finalized at 0x{:X} (setup header size: {} bytes, init_size: 0x{:X})", gpa.raw_value(), setup_header_size, init_size);
-
+    partition.write_code(boot_params, gpa.0)?;
 
     create_acpi_tables(partition.device_manager(), partition.cpu_manager(), partition.memory_manager());
-    Ok(init_size)
+    Ok(())
 }
 
 /// Set up identity paging for 64-bit boot protocol
