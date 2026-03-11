@@ -10,6 +10,7 @@ use anyhow::Result;
 use anyhow::Context;
 use std::{ffi::c_void, ptr};
 use std::fs;
+use tracing::{debug};
 
 use crate::{cpu::CpuManager, device_manager::DeviceManager, devices::bus::BusDevice, emulator::{self, Emulator}, linux_boot::{self, LinuxBootPartition}, memory::{layout, memory::{GuestAddress, MemoryAccessViolation, MemoryManager, MemoryPerms, MemoryRegion, MmioRegion}}};
 use std::collections::HashMap;
@@ -24,6 +25,10 @@ pub struct Partition {
     cpu_manager: CpuManager, // CPU management (ACPI MADT, CPU topology)
     mmio_handlers: HashMap<String, Box<dyn BusDevice>>, // MMIO device handlers by name
     pub pci_address_config: u32,
+    // Hyper-V enlightenment state
+    vm_start_tsc: u64,              // Host TSC value captured at VM creation
+    tsc_reference_gpa: Option<u64>, // GPA of the TSC reference page (set by guest via MSR 0x40000021)
+    guest_os_id: u64,               // Value written by guest to HV_X64_MSR_GUEST_OS_ID
 }
 
 #[derive(Clone)]
@@ -62,6 +67,9 @@ impl Partition {
                 cpu_manager: CpuManager::new(),
                 mmio_handlers: HashMap::new(),
                 pci_address_config: 0,
+                vm_start_tsc: core::arch::x86_64::_rdtsc(),
+                tsc_reference_gpa: None,
+                guest_os_id: 0,
             })
         }
     }
@@ -142,9 +150,24 @@ impl Partition {
                 return Err(anyhow::anyhow!("Failed to enable Local APIC emulation: {:?}", result));
             }
 
-            
+            // 4. Configure CPUID exit list for Hyper-V enlightenment leaves.
+            // This ensures we intercept CPUID for the 0x4000000x range so we can
+            // advertise Hyper-V features (including the Reference TSC Page).
+            let cpuid_exit_list: [u32; 6] = [
+                0x40000000, // Hypervisor CPUID leaf range and vendor ID
+                0x40000001, // Hypervisor interface identification
+                0x40000002, // Hypervisor system identity
+                0x40000003, // Hypervisor feature identification
+                0x40000004, // Enlightenment recommendations
+                0x40000005, // Implementation limits
+            ];
+            WHvSetPartitionProperty(
+                self.handle,
+                WHvPartitionPropertyCodeCpuidExitList,
+                cpuid_exit_list.as_ptr() as *const _,
+                (cpuid_exit_list.len() * std::mem::size_of::<u32>()) as u32,
+            )?;
 
-           
                 WHvSetupPartition(self.handle)?;
             Ok(())
         }
@@ -417,6 +440,68 @@ impl Partition {
             // The hypervisor will set appropriate defaults for the VM mode
             Ok(())
         }
+    }
+
+    /// Get the host TSC frequency in Hz.
+    /// Tries CPUID leaf 0x15 (TSC/crystal ratio), then 0x16 (processor base frequency).
+    fn get_tsc_frequency_hz() -> u64 {
+        unsafe {
+            // Try CPUID 0x15: TSC frequency = ECX * EBX / EAX
+            let cpuid15 = core::arch::x86_64::__cpuid(0x15);
+            if cpuid15.eax != 0 && cpuid15.ebx != 0 && cpuid15.ecx != 0 {
+                return (cpuid15.ecx as u64 * cpuid15.ebx as u64) / cpuid15.eax as u64;
+            }
+
+            // Fall back to CPUID 0x16: EAX = processor base frequency in MHz
+            let cpuid16 = core::arch::x86_64::__cpuid(0x16);
+            if cpuid16.eax != 0 {
+                return cpuid16.eax as u64 * 1_000_000;
+            }
+
+            // Last resort fallback
+            2_712_000_000
+        }
+    }
+
+    /// Write the Hyper-V Reference TSC Page into guest memory at the given GPA.
+    ///
+    /// The page layout (HV_REFERENCE_TSC_PAGE):
+    ///   +0x00: u32 TscSequence  (non-zero = valid)
+    ///   +0x04: u32 Reserved
+    ///   +0x08: u64 TscScale
+    ///   +0x10: i64 TscOffset
+    ///   +0x18: ... (rest of page zeroed)
+    ///
+    /// Guest formula: ReferenceTime = ((RDTSC() * TscScale) >> 64) + TscOffset
+    /// Result is in 100-nanosecond units (10 MHz).
+    fn write_tsc_reference_page(&self, gpa: u64) -> Result<()> {
+        let tsc_freq = Self::get_tsc_frequency_hz();
+
+        // TscScale: fixed-point multiplier that converts TSC ticks → 100ns ticks.
+        // (10_000_000 << 64) / tsc_freq, computed via 128-bit math.
+        let tsc_scale: u64 = ((10_000_000u128 << 64) / tsc_freq as u128) as u64;
+
+        // TscOffset: calibrate so ReferenceTime ≈ 0 at VM start.
+        // offset = -((vm_start_tsc * scale) >> 64)
+        let tsc_offset: i64 = -(((self.vm_start_tsc as u128 * tsc_scale as u128) >> 64) as i64);
+
+        let mut page = [0u8; 4096];
+        page[0..4].copy_from_slice(&1u32.to_le_bytes());       // TscSequence = 1 (valid)
+        // page[4..8] is reserved (already zero)
+        page[8..16].copy_from_slice(&tsc_scale.to_le_bytes()); // TscScale
+        page[16..24].copy_from_slice(&tsc_offset.to_le_bytes()); // TscOffset
+
+        self.memory.write_guest_memory(&page, GuestAddress(gpa))?;
+
+        debug!(
+            gpa = format_args!("0x{:X}", gpa),
+            tsc_freq_mhz = tsc_freq / 1_000_000,
+            tsc_scale = format_args!("0x{:016X}", tsc_scale),
+            tsc_offset = tsc_offset,
+            "Hyper-V Reference TSC Page written"
+        );
+
+        Ok(())
     }
 
     pub fn run_vp(&self, vp_id: u32) -> Result<WHV_RUN_VP_EXIT_CONTEXT, String> {
@@ -785,8 +870,6 @@ impl Partition {
                 Ok(true)
             }
             x if x == WHvRunVpExitReasonX64Cpuid.0 => {
-                eprintln!("CPUID: 0x{:X}", exit_context.VpContext.Rip);
-
                 let cpuid_access = unsafe { &exit_context.Anonymous.CpuidAccess };
                 let leaf = cpuid_access.Rax;
 
@@ -796,9 +879,58 @@ impl Partition {
                 let mut rdx = cpuid_access.DefaultResultRdx;
 
                 match leaf {
+                    0x40000000 => {
+                        // Hyper-V hypervisor present: max leaf + "Microsoft Hv" vendor signature.
+                        // Linux checks EBX:ECX:EDX == "Microsoft Hv" to detect Hyper-V.
+                        rax = 0x40000005; // max hypervisor CPUID leaf
+                        rbx = u32::from_le_bytes(*b"Micr") as u64;
+                        rcx = u32::from_le_bytes(*b"osof") as u64;
+                        rdx = u32::from_le_bytes(*b"t Hv") as u64;
+                    }
+                    0x40000001 => {
+                        // Hypervisor interface identification: "Hv#1"
+                        rax = u32::from_le_bytes(*b"Hv#1") as u64;
+                        rbx = 0;
+                        rcx = 0;
+                        rdx = 0;
+                    }
+                    0x40000002 => {
+                        // Hypervisor system identity (version info — informational only)
+                        rax = 0;               // Build number
+                        rbx = (10 << 16) | 0;  // Major.Minor version
+                        rcx = 0;               // Service pack
+                        rdx = 0;               // Service branch
+                    }
+                    0x40000003 => {
+                        // Hypervisor feature identification.
+                        // EAX privilege bits the guest may use:
+                        //   Bit  1: AccessPartitionReferenceCounter (MSR 0x40000020)
+                        //   Bit  9: AccessReferenceTsc (MSR 0x40000021 — the TSC page)
+                        //   Bit 15: AccessTscInvariantControls (MSR 0x40000118)
+                        //           Linux writes to this MSR and then calls
+                        //           setup_force_cpu_cap(X86_FEATURE_TSC_RELIABLE),
+                        //           which tells the clocksource watchdog to trust TSC.
+                        rax = (1 << 1) | (1 << 9) | (1 << 15);
+                        rbx = 0;
+                        rcx = 0;
+                        rdx = 0;
+                    }
+                    0x40000004 => {
+                        // Enlightenment recommendations / hints
+                        rax = 0;
+                        rbx = 0;
+                        rcx = 0;
+                        rdx = 0;
+                    }
+                    0x40000005 => {
+                        // Implementation limits
+                        rax = 0;
+                        rbx = 0;
+                        rcx = 0;
+                        rdx = 0;
+                    }
                     _ => {
-                        // For all standard CPUID requests (like getting the vendor string
-                        // or cache sizes), we just pass through the default results.
+                        // For all other CPUID requests, pass through the default results.
                     }
                 }
 
@@ -843,26 +975,69 @@ impl Partition {
 
                 match msr_number {
                     0x40000000 => { // HV_X64_MSR_GUEST_OS_ID
-                        // If it's a read, we can just return 0 or whatever was last written.
-                        // Linux writes to this to identify itself.
+                        if is_write {
+                            self.guest_os_id = (msr_access.Rdx << 32) | (msr_access.Rax & 0xFFFFFFFF);
+                        } else {
+                            rax = self.guest_os_id & 0xFFFFFFFF;
+                            rdx = self.guest_os_id >> 32;
+                        }
                     }
                     0x40000001 => { // HV_X64_MSR_HYPERCALL
-                        // This is the big one. Linux expects to see 'Enabled' bit (bit 0) 
-                        // if it previously wrote to it.
+                        // Linux expects to see 'Enabled' bit (bit 0) if it previously wrote to it.
                         if !is_write {
                             rax = 1; // Mark as enabled
                         }
                     }
-                    0x40000020 => { // HV_X64_MSR_TIME_REF_COUNT
-                        // Return elapsed time since VM start in 100ns increments (Hyper-V reference time).
-                        // BUG FIX: Previously used Instant::now().elapsed() which always returns ~0.
-                        // Must use a fixed start time so the clock actually advances.
+                    0x40000020 => { // HV_X64_MSR_TIME_REF_COUNT (read-only)
+                        // Return elapsed time since VM start in 100ns increments.
+                        // This is the slow (MSR-exit) fallback; once the TSC reference page
+                        // is active, the guest won't use this MSR for timekeeping.
                         use std::sync::OnceLock;
                         static VM_START_TIME: OnceLock<std::time::Instant> = OnceLock::new();
                         let start = VM_START_TIME.get_or_init(|| std::time::Instant::now());
                         let ticks = start.elapsed().as_nanos() / 100; // 100ns increments
                         rax = (ticks & 0xFFFFFFFF) as u64;
                         rdx = ((ticks >> 32) & 0xFFFFFFFF) as u64;
+                    }
+                    0x40000021 => { // HV_X64_MSR_REFERENCE_TSC
+                        // The guest writes a GPA (page-aligned) with bit 0 = enable.
+                        // We populate a shared page at that GPA with TSC scale/offset so the
+                        // guest can compute time via RDTSC without any further VM exits.
+                        if is_write {
+                            let msr_value = (msr_access.Rdx << 32) | (msr_access.Rax & 0xFFFFFFFF);
+                            let enabled = msr_value & 1;
+                            if enabled != 0 {
+                                let gpa = msr_value & !0xFFF; // bits 63:12 are the PFN, page-aligned
+                                self.write_tsc_reference_page(gpa)?;
+                                self.tsc_reference_gpa = Some(gpa);
+                            } else {
+                                self.tsc_reference_gpa = None;
+                            }
+                        } else {
+                            // Read back: return stored GPA | enabled bit
+                            if let Some(gpa) = self.tsc_reference_gpa {
+                                let value = gpa | 1; // set enabled bit
+                                rax = value & 0xFFFFFFFF;
+                                rdx = value >> 32;
+                            }
+                        }
+                    }
+                    0x40000118 => { // HV_X64_MSR_TSC_INVARIANT_CONTROL
+                        // Linux writes HV_EXPOSE_INVARIANT_TSC (bit 0) here when it sees
+                        // AccessTscInvariantControls (CPUID 0x40000003 bit 15).
+                        // After writing, Linux calls setup_force_cpu_cap(X86_FEATURE_TSC_RELIABLE)
+                        // which makes the clocksource watchdog trust TSC unconditionally.
+                        // We just accept the write (sink) and return it on read.
+                        static TSC_INVARIANT_CONTROL: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        if is_write {
+                            let val = (msr_access.Rdx << 32) | (msr_access.Rax & 0xFFFFFFFF);
+                            TSC_INVARIANT_CONTROL.store(val, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            let val = TSC_INVARIANT_CONTROL.load(std::sync::atomic::Ordering::Relaxed);
+                            rax = val & 0xFFFFFFFF;
+                            rdx = val >> 32;
+                        }
                     }
                     _ => {}
                 }
