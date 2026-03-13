@@ -96,6 +96,10 @@ impl CpuManager {
         self.cpus = count;
     }
 
+    pub fn get_cpu_count(&self) -> u32 {
+        self.cpus
+    }
+
     pub fn create_madt(&self) -> Sdt {
         let mut madt = Sdt::new(*b"APIC", 44, 5, *b"CLOUDH", *b"CHMADT  ", 1);
         

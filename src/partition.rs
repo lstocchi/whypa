@@ -1,7 +1,7 @@
 use windows::Win32::System::{
     Hypervisor::*,
     Memory::{
-        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     },
 };
 
@@ -25,6 +25,10 @@ pub struct Partition {
     pub(crate) vm_start_tsc: u64,
     pub(crate) tsc_reference_gpa: Option<u64>,
     pub(crate) guest_os_id: u64,
+    // Host backing memory allocated via VirtualAlloc – stored so we can
+    // properly VirtualFree it in Drop.
+    guest_memory_base: Option<*mut c_void>,
+    guest_memory_size: u64,
 }
 
 // Partition is safe to send between threads because:
@@ -51,6 +55,8 @@ impl Partition {
                 vm_start_tsc: core::arch::x86_64::_rdtsc(),
                 tsc_reference_gpa: None,
                 guest_os_id: 0,
+                guest_memory_base: None,
+                guest_memory_size: 0,
             })
         }
     }
@@ -148,6 +154,10 @@ impl Partition {
             if source.is_null() {
                 return Err(anyhow::anyhow!("Failed to allocate memory"));
             }
+
+            // Store the base pointer so Drop can VirtualFree it.
+            self.guest_memory_base = Some(source);
+            self.guest_memory_size = total_memory;
 
             if total_memory <= layout::MEM_32BIT_RESERVED_START.0 {
                 WHvMapGpaRange(
@@ -363,11 +373,51 @@ impl LinuxBootPartition for Partition {
 
 impl Drop for Partition {
     fn drop(&mut self) {
-        unsafe {
-            if !self.emulator.handle.is_null() {
+        // Cleanup in reverse order of creation
+
+        // 1. Drop MMIO handlers first — this triggers VirtioDevice drops which
+        //    signal worker stop events and join worker threads, ensuring no
+        //    background thread is still touching guest memory.
+        self.mmio_handlers.clear();
+
+        // 2. Delete all virtual processors before deleting the partition.
+        for vp_id in 0..self.cpu_manager.get_cpu_count() {
+            unsafe {
+                let _ = WHvDeleteVirtualProcessor(self.handle, vp_id);
+            }
+        }
+
+        // 3. Unmap all GPA ranges so the kernel driver releases its
+        //    internal references to the host memory before we free it.
+        for region in &self.memory.regions {
+            unsafe {
+                let _ = WHvUnmapGpaRange(
+                    self.handle,
+                    region.start_addr().raw_value(),
+                    region.len(),
+                );
+            }
+        }
+
+        // 4. Destroy the instruction emulator.
+        if !self.emulator.handle.is_null() {
+            unsafe {
                 let _ = WHvEmulatorDestroyEmulator(self.emulator.handle);
             }
+            // Prevent the Emulator's own drop from double-destroying.
+            self.emulator.handle = ptr::null_mut();
+        }
+
+        // 5. Delete the partition handle.
+        unsafe {
             let _ = WHvDeletePartition(self.handle);
+        }
+
+        // 6. Free the VirtualAlloc'd guest memory backing.
+        if let Some(base) = self.guest_memory_base.take() {
+            unsafe {
+                let _ = VirtualFree(base, 0, MEM_RELEASE);
+            }
         }
     }
 }
