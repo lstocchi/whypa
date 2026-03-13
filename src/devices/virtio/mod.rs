@@ -18,6 +18,7 @@ mod bindings;
 pub mod block;
 pub mod rng;
 pub mod console;
+pub mod net;
 
 /// When the driver initializes the device, it lets the device know about the
 /// completed stages using the Device Status Field.

@@ -13,6 +13,7 @@ use crate::devices::legacy::irqchip::{IrqChip, IrqChipDevice};
 use crate::devices::virtio::block::{Block, CacheType, ImageType, SyncMode};
 use crate::devices::virtio::console::device::Console;
 use crate::devices::virtio::mmio::MmioTransport;
+use crate::devices::virtio::net::device::Net;
 use crate::devices::virtio::rng::Rng;
 use crate::memory::{layout, memory::GuestAddress};
 use crate::partition::Partition;
@@ -21,13 +22,14 @@ use crate::partition::Partition;
 const VIRTIO_BLOCK_IRQ: u32 = 20;
 const VIRTIO_RNG_IRQ: u32 = 21;
 const VIRTIO_CONSOLE_IRQ: u32 = 22;
+const VIRTIO_NET_IRQ: u32 = 23;
 
 // ===========================================================================
 // Device registration – wires up all devices on the partition
 // ===========================================================================
 
 /// Register all devices on the partition: IOAPIC, PCI ECAM stub, and virtio
-/// devices (block, rng, console).
+/// devices (block, rng, console, net).
 pub fn register_devices(
     partition: &mut Partition,
     rootfs_path: &str,
@@ -41,6 +43,7 @@ pub fn register_devices(
     setup_virtio_block(partition, &irqchip, rootfs_path)?;
     setup_virtio_rng(partition, &irqchip)?;
     setup_virtio_console(partition, &irqchip, input_buffer, input_event)?;
+    setup_virtio_net(partition, &irqchip)?;
 
     info!("All devices registered");
     Ok(())
@@ -238,6 +241,43 @@ fn setup_virtio_console(
 
     debug!(base = format_args!("0x{:X}", base), irq = VIRTIO_CONSOLE_IRQ,
            "Virtio console device registered");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Virtio net device
+// ---------------------------------------------------------------------------
+
+/// Default MAC address — locally-administered, unicast (QEMU range).
+const DEFAULT_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+
+/// Register the virtio-net device backed by gvproxy.
+fn setup_virtio_net(partition: &mut Partition, irqchip: &IrqChip) -> Result<()> {
+    let base = layout::VIRTIO_MMIO_START.0 + 3 * layout::VIRTIO_MMIO_SIZE_PER_DEVICE;
+    let size = layout::VIRTIO_MMIO_SIZE_PER_DEVICE;
+
+    let net_device = Arc::new(Mutex::new(Net::new(DEFAULT_MAC)?));
+
+    let mut transport = MmioTransport::new(
+        partition.memory_manager().clone(),
+        irqchip.clone(),
+        net_device,
+    )?;
+    transport.set_irq_line(VIRTIO_NET_IRQ);
+
+    partition.register_mmio_region(
+        base,
+        size,
+        "Virtio Net Device".to_string(),
+        Some("virtio_net".to_string()),
+    )?;
+    partition.register_mmio_handler("virtio_net".to_string(), Box::new(transport));
+    partition.device_manager_mut().register_virtio_mmio(
+        "VNET".to_string(), 4, base, size, VIRTIO_NET_IRQ,
+    );
+
+    debug!(base = format_args!("0x{:X}", base), irq = VIRTIO_NET_IRQ,
+           mac = ?DEFAULT_MAC, "Virtio net device registered");
     Ok(())
 }
 
