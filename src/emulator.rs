@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::System::{
     Hypervisor::*,
@@ -6,10 +6,10 @@ use windows::Win32::System::{
 
 use anyhow::Result;
 
-static mut DUMMY_RTC_TIME: u64 = 0;
-static mut DUMMY_RTC_COUNTER: u64 = 0;
+static DUMMY_RTC_TIME: AtomicU64 = AtomicU64::new(0);
+static DUMMY_RTC_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-static mut REFRESH_BIT: u8 = 0;
+static INTERNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct Emulator {
     pub handle: *mut std::ffi::c_void,
@@ -85,27 +85,25 @@ impl Emulator {
                         io_info.Data = 99;
                     }
                     0x40 | 0x43 => {
-                        DUMMY_RTC_COUNTER = DUMMY_RTC_COUNTER.wrapping_add(1);
-                        if DUMMY_RTC_COUNTER % 100 == 0 {
-                            DUMMY_RTC_TIME = DUMMY_RTC_TIME.wrapping_add(1);
+                        let counter = DUMMY_RTC_COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                        if counter % 100 == 0 {
+                            DUMMY_RTC_TIME.fetch_add(1, Ordering::Relaxed);
                         }
-                        io_info.Data = DUMMY_RTC_TIME as u32;
+                        io_info.Data = DUMMY_RTC_TIME.load(Ordering::Relaxed) as u32;
                     }
                     0x61 => {
                         // It simulates a more stable "hardware-like" behavior by ensuring the bit stays in one state for a consistent number of reads, and then flips.
-                        static mut INTERNAL_COUNTER: u64 = 0;
-                        
-                        INTERNAL_COUNTER += 1;
+                        let counter = INTERNAL_COUNTER.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
                         
                         // Bit 4: Refresh Toggle (the one Linux is likely polling)
                         // Bit 5: Speaker Output (sometimes checked as a secondary timer)
                         
                         // Let's toggle Bit 4 every 128 reads. This provides a "slow" enough
                         // pulse that the kernel's loop will definitely catch both 0 and 1.
-                        let bit4 = ((INTERNAL_COUNTER >> 7) & 1) << 4;
+                        let bit4 = ((counter >> 7) & 1) << 4;
                         
                         // Let's also toggle Bit 5 at a different rate just in case
-                        let bit5 = ((INTERNAL_COUNTER >> 6) & 1) << 5;
+                        let bit5 = ((counter >> 6) & 1) << 5;
                         
                         io_info.Data = (bit4 | bit5) as u32;
                         
