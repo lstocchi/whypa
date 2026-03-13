@@ -174,3 +174,11 @@ impl VirtioDevice for Console {
         true
     }
 }
+
+impl Drop for Console {
+    fn drop(&mut self) {
+        if self.worker_thread.is_some() {
+            self.reset();
+        }
+    }
+}

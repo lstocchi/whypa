@@ -163,3 +163,11 @@ impl VirtioDevice for Net {
         true
     }
 }
+
+impl Drop for Net {
+    fn drop(&mut self) {
+        if self.worker_thread.is_some() {
+            self.reset();
+        }
+    }
+}

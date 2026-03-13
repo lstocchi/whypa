@@ -433,3 +433,11 @@ impl VirtioDevice for Block {
         true
     }
 }
+
+impl Drop for Block {
+    fn drop(&mut self) {
+        if self.worker_thread.is_some() {
+            self.reset();
+        }
+    }
+}

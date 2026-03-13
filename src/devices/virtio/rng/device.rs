@@ -96,3 +96,11 @@ impl VirtioDevice for Rng {
         true
     }
 }
+
+impl Drop for Rng {
+    fn drop(&mut self) {
+        if self.worker_thread.is_some() {
+            self.reset();
+        }
+    }
+}
