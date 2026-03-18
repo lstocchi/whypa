@@ -1,6 +1,6 @@
 //! vCPU execution loop and VM-exit handling.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use tracing::{debug, error, info, warn};
@@ -12,8 +12,8 @@ use crate::partition::Partition;
 /// Run the vCPU execution loop on the calling thread.
 ///
 /// Keeps running until the partition signals a stop, an unrecoverable error
-/// occurs, or `running` is set to `false` (e.g. by the Ctrl+C handler).
-pub fn run(partition: &mut Partition, kernel_entry: u64, running: &AtomicBool) {
+/// occurs, or `running` is set to `false` (e.g. by the Ctrl+] escape key).
+pub fn run(partition: &mut Partition, kernel_entry: u64) {
     match partition.verify_rip(0) {
         Ok(rip) => {
             if rip != kernel_entry {
@@ -31,7 +31,7 @@ pub fn run(partition: &mut Partition, kernel_entry: u64, running: &AtomicBool) {
     let mut last_rip: u64 = 0;
     let mut rip_repeat_count: u64 = 0;
 
-    while running.load(Ordering::Relaxed) {
+    while partition.is_running() {
         iteration += 1;
 
         let exit_context = match partition.run_vp(0) {
@@ -69,9 +69,7 @@ pub fn run(partition: &mut Partition, kernel_entry: u64, running: &AtomicBool) {
                 break;
             }
             Err(e) => {
-                error!(error = %e, iteration,
-                       rip = format_args!("0x{:X}", current_rip),
-                       "Error handling VM exit");
+                error!(error = %e, iteration, "Error handling VM exit");
                 break;
             }
         }
@@ -81,8 +79,10 @@ pub fn run(partition: &mut Partition, kernel_entry: u64, running: &AtomicBool) {
         }
     }
 
-    if !running.load(Ordering::Relaxed) {
-        info!(iteration, "VM stopped by Ctrl+C");
+    if !partition.is_running() {
+        info!(iteration,
+              last_rip = format_args!("0x{:X}", last_rip),
+              "VM stopped by user (Ctrl+])");
     }
 }
 
@@ -104,8 +104,6 @@ impl Partition {
                     .ok_or_else(|| anyhow::anyhow!("Failed to extract memory access violation"))?;
 
                 if self.memory.find_mmio(violation.gpa.0).is_some() {
-                    // Use the WHP emulator to handle MMIO – it decodes the instruction,
-                    // calls our memory_callback, and updates the correct register.
                     let memory_access_ctx = unsafe { &exit_context.Anonymous.MemoryAccess };
                     let vp_context = &exit_context.VpContext;
 
@@ -124,10 +122,8 @@ impl Partition {
                     if !region.perms.contains(violation.action) {
                         return Ok(false);
                     }
-                    // Valid access to mapped memory shouldn't normally cause an exit.
                     Ok(false)
                 } else {
-                    // Unmapped memory access (page fault).
                     Ok(false)
                 }
             }
@@ -146,6 +142,11 @@ impl Partition {
             }
 
             x if x == WHvRunVpExitReasonX64Halt.0 => Ok(true),
+
+            x if x == WHvRunVpExitReasonCanceled.0 => {
+                debug!("VP run cancelled");
+                Ok(false)
+            }
 
             x if x == WHvRunVpExitReasonX64ApicEoi.0 => {
                 // Forward EOI to the IOAPIC so it can clear Remote IRR for

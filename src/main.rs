@@ -64,7 +64,7 @@ fn main() -> anyhow::Result<()> {
     partition.allocate_memory_with_size(cfg.memory_size as u64, MemoryPerms::RWX)?;
     debug!("Partition configured and memory allocated");
 
-    // Enter raw mode, register the Ctrl+C handler, and start the stdin reader.
+    // Enter raw mode, register the escape-key handler, and start the stdin reader.
     let console = HostConsole::enter_raw_mode();
     let (input_buffer, input_event) = console.spawn_stdin_reader();
 
@@ -84,9 +84,10 @@ fn main() -> anyhow::Result<()> {
     )?;
     partition.setup_linux_registers(0, kernel_entry)?;
     info!(entry = format_args!("0x{:X}", kernel_entry), "Kernel loaded, starting VM");
+    eprintln!("Press Ctrl+] to exit the VM.");
 
     // Run the vCPU loop on the main thread until shutdown.
-    vm::run(&mut partition, kernel_entry, console.running());
+    vm::run(&mut partition, kernel_entry);
 
     Ok(())
 }

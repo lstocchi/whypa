@@ -7,11 +7,15 @@ use windows::Win32::System::{
 
 use anyhow::Result;
 use anyhow::Context;
-use std::{ffi::c_void, ptr};
+use std::{ffi::c_void, ptr, sync::atomic::{AtomicBool, AtomicIsize, Ordering}};
 use std::fs;
 
 use crate::{cpu::CpuManager, device_manager::DeviceManager, devices::bus::BusDevice, emulator::Emulator, linux_boot::{self, LinuxBootPartition}, memory::{layout, memory::{GuestAddress, MemoryAccessViolation, MemoryManager, MemoryPerms, MemoryRegion, MmioRegion}}};
 use std::collections::HashMap;
+
+/// Global flags set by the escape-key detector or the console ctrl handler.
+static CANCEL_HANDLE: AtomicIsize = AtomicIsize::new(0);
+static RUNNING: AtomicBool = AtomicBool::new(true);
 
 pub struct Partition {
     pub handle: WHV_PARTITION_HANDLE,
@@ -38,12 +42,14 @@ unsafe impl Send for Partition {}
 
 impl Partition {
     pub fn new(memory_size: usize) -> Result<Self> {
+        
         unsafe {
             let handle = WHvCreatePartition()?;
             let emulator = Emulator::new()?;
 
             let mut device_manager = DeviceManager::new(GuestAddress(memory_size as u64));
             device_manager.init();
+            CANCEL_HANDLE.store(handle.0 as isize, Ordering::Relaxed);
             Ok(Self {
                 handle,
                 emulator,
@@ -103,6 +109,10 @@ impl Partition {
         &mut self.mmio_handlers
     }
 
+    pub fn is_running(&self) -> bool {
+        RUNNING.load(Ordering::Relaxed)
+    }
+
     pub fn setup(&self) -> Result<()> {
         unsafe {
             let mut property: WHV_PARTITION_PROPERTY = std::mem::zeroed();
@@ -144,6 +154,16 @@ impl Partition {
         unsafe {
             WHvCreateVirtualProcessor(self.handle, vp_id, 0)?;
             Ok(())
+        }
+    }
+
+    pub fn cancel_vp() {
+        RUNNING.store(false, Ordering::Relaxed);
+        let h = CANCEL_HANDLE.load(Ordering::Relaxed);
+        if h != 0 {
+            unsafe {
+                let _ = WHvCancelRunVirtualProcessor(WHV_PARTITION_HANDLE(h), 0, 0);
+            }
         }
     }
 

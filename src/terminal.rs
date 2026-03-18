@@ -1,4 +1,4 @@
-//! Host terminal handling – raw mode, VT output, stdin reader, and Ctrl+C.
+//! Host terminal handling – raw mode, VT output, stdin reader, and escape key.
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -12,20 +12,22 @@ use windows::Win32::System::Console::{
     GetConsoleMode, SetConsoleMode, GetStdHandle, SetConsoleCtrlHandler,
     STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
-    ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
+    ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT,
+    ENABLE_VIRTUAL_TERMINAL_INPUT,
     ENABLE_VIRTUAL_TERMINAL_PROCESSING,
 };
 
 use crate::devices::event::WindowsEvent;
+use crate::partition::Partition;
 
-/// Global flag set by the console ctrl handler.  The vCPU loop polls this.
-static RUNNING: AtomicBool = AtomicBool::new(true);
+/// The escape byte used to quit the VM (Ctrl+], 0x1D – same as telnet).
+const ESCAPE_KEY: u8 = 0x1D;
 
-/// Console ctrl handler called by Windows on Ctrl+C, Ctrl+Break, or window close.
+/// Console ctrl handler called by Windows on Ctrl+Break or window close.
 unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> BOOL {
     // Any control event → request graceful shutdown.
-    info!("Ctrl+C received, shutting down");
-    RUNNING.store(false, Ordering::Relaxed);
+    info!("Console control event received, shutting down");
+    signal_shutdown();
     BOOL(1) // TRUE = we handled it, don't terminate the process
 }
 
@@ -38,13 +40,16 @@ pub struct HostConsole {
 impl HostConsole {
     /// Switch the host console into raw mode suitable for guest I/O:
     ///
-    /// - **stdin**: disable echo and line-editing; keep processed-input so
-    ///   Ctrl+C still generates `CTRL_C_EVENT`.
+    /// - **stdin**: disable echo, line-editing, **and** processed-input so
+    ///   Ctrl+C is delivered as the raw byte `0x03` (forwarded to the guest)
+    ///   instead of generating `CTRL_C_EVENT`.
     ///   Enable virtual-terminal input so we get escape sequences as-is.
     /// - **stdout**: enable VT processing so ANSI escape sequences from the
     ///   guest render correctly on the Windows console.
-    /// - Registers a console ctrl handler so Ctrl+C sets the [`running()`]
-    ///   flag to `false` instead of killing the process.
+    /// - Registers a console ctrl handler so Ctrl+Break / window close still
+    ///   trigger a graceful shutdown.
+    ///
+    /// To exit the VM press **Ctrl+]** (the telnet escape key).
     pub fn enter_raw_mode() -> Self {
         let saved_stdin_mode = unsafe { Self::setup_stdin() };
         unsafe {
@@ -56,16 +61,9 @@ impl HostConsole {
         Self { saved_stdin_mode }
     }
 
-    /// Returns a reference to the global shutdown flag.
-    ///
-    /// The vCPU loop should poll this with [`AtomicBool::load`] to detect
-    /// Ctrl+C.
-    pub fn running(&self) -> &'static AtomicBool {
-        &RUNNING
-    }
-
     /// Spawn a background thread that reads from the host stdin, strips CPR
-    /// responses, and pushes filtered bytes into a shared buffer.
+    /// responses, detects the escape key (Ctrl+]), and pushes filtered bytes
+    /// into a shared buffer.
     ///
     /// Returns the `(buffer, event)` pair that should be handed to the virtio
     /// console device.
@@ -89,11 +87,20 @@ impl HostConsole {
                             break;
                         }
                         Ok(n) => {
-                            let filtered = strip_cpr_responses(&raw[..n]);
-                            if !filtered.is_empty() {
-                                thread_buf.lock().unwrap().extend(&filtered);
-                                thread_evt.signal();
+                            let bytes = &raw[..n];
+
+                            // Check for Ctrl+] (0x1D) — the VM escape key.
+                            if let Some(pos) = bytes.iter().position(|&b| b == ESCAPE_KEY) {
+                                // Forward any bytes that arrived before the escape key.
+                                if pos > 0 {
+                                    strip_response_and_signal(&bytes[..pos], &thread_buf, &thread_evt);
+                                }
+                                info!("Ctrl+] received, shutting down VM");
+                                signal_shutdown();
+                                break;
                             }
+
+                            strip_response_and_signal(bytes, &thread_buf, &thread_evt);
                         }
                         Err(e) => {
                             error!(error = %e, "Error reading stdin");
@@ -115,9 +122,10 @@ impl HostConsole {
         GetConsoleMode(h, &mut mode).ok()?;
 
         let saved = mode;
-        // Keep ENABLE_PROCESSED_INPUT so Ctrl+C still generates CTRL_C_EVENT
-        // (caught by our SetConsoleCtrlHandler callback).
-        let raw = (mode & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT))
+        // Clear ENABLE_PROCESSED_INPUT so Ctrl+C is delivered as the raw byte
+        // 0x03 and forwarded to the guest rather than generating CTRL_C_EVENT.
+        // https://learn.microsoft.com/en-us/windows/console/setconsolemode
+        let raw = (mode & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT))
             | ENABLE_VIRTUAL_TERMINAL_INPUT;
         let _ = SetConsoleMode(h, raw);
 
@@ -139,13 +147,25 @@ impl HostConsole {
 
 impl Drop for HostConsole {
     fn drop(&mut self) {
-        // Remove our handler (restore default Ctrl+C behaviour).
+        // Remove our handler (restore default Ctrl+C / Ctrl+Break behaviour).
         unsafe { let _ = SetConsoleCtrlHandler(Some(ctrl_handler), false); }
 
         if let Some((h, saved)) = self.saved_stdin_mode {
             unsafe { let _ = SetConsoleMode(h, saved); }
             debug!("Host console mode restored");
         }
+    }
+}
+
+fn signal_shutdown() {
+    Partition::cancel_vp();
+}
+
+fn strip_response_and_signal(bytes: &[u8], thread_buf: &Arc<Mutex<VecDeque<u8>>>, thread_evt: &Arc<WindowsEvent>) {
+    let filtered = strip_cpr_responses(bytes);
+    if !filtered.is_empty() {
+        thread_buf.lock().unwrap().extend(&filtered);
+        thread_evt.signal();
     }
 }
 
